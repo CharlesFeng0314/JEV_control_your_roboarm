@@ -1,0 +1,47 @@
+# Keep this working tree as the only copy. Git only publishes product files.
+# Everything below stays on this machine.
+
+# Local setup and secrets
+.env
+docs/local-environment.md
+.cursor/
+.vscode/
+.conda/
+.conda-isaacsim/
+.benchmark_deps/
+environment.yml
+environment-isaacsim.yml
+environment-ros2-humble.yml
+requirements-laya.txt
+scripts/setup_isaacsim.ps1
+scripts/doctor.py
+scripts/doctor_isaacsim.py
+scripts/capture_rgbd.py
+
+# Not part of the product
+scripts/benchmark/
+scripts/manipulation/simulation/
+scripts/manipulation/config/
+scripts/manipulation/adapters/
+scripts/manipulation/workflows/
+scripts/manipulation/provenance.py
+scripts/manipulation/README.md
+scripts/manipulation/adapters/
+tests/
+scenes/benchmark/
+scenes/manipulation/*.build.json
+
+# Generated and local models
+/Ultralytics/
+/weights/
+data/
+models/
+logs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/

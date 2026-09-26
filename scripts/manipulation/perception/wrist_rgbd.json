@@ -1,0 +1,24 @@
+{
+  "table_top_z_m": 0.010408,
+  "wrist_camera": {
+    "mount_translation_m": [0.06, 0.0, 0.02],
+    "look_at_in_parent_m": [0.0, 0.0, 0.105],
+    "resolution": [640, 480],
+    "depth_near_m": 0.02,
+    "depth_far_m": 10.0,
+    "gripper_exclusion_box_min_m": [-0.025, -0.055, 0.02],
+    "gripper_exclusion_box_max_m": [0.025, 0.055, 0.125]
+  },
+  "perception": {
+    "method": "rgbd_world_cluster_semantic_fusion",
+    "clip_model": "ViT-B/32",
+    "pixel_stride": 2,
+    "dbscan_eps_m": 0.038,
+    "dbscan_min_samples": 8,
+    "minimum_mask_area_px": 80,
+    "minimum_target_semantic_score": 0.2,
+    "visible_surface_center_bias_m": 0.012,
+    "infer_upright_center_z_from_table": true,
+    "upright_grasp_height_fraction": 0.68
+  }
+}

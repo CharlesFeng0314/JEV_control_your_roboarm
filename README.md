@@ -1,61 +1,47 @@
-# jevcontrol_your_roboarm
+# JEV Control Your Roboarm
 
-自然语言目标进入决策循环。JEV 从 action 清单里选择，对应模块做参数校验，再交给驱动执行，并把新的观察送进下一轮。
+你用一句话说出要做的事。JEV 看着机械臂现在能看见什么、能做什么，然后决定下一步。程序检查这个决定，让机械臂去做，做完再看一次，再交给 JEV，直到这件事做完，或者 JEV 停下来问你。
 
-只改这个仓库里的文件。公开 GitHub 也是从这里推上去的，没有第二份代码目录。
+JEV 不直接拧电机。它每次只选一个 **action**：机械臂被允许做的一件事，以及这件事允许范围内的参数，比如往哪边、动多少、看到什么为止。
 
-密钥、本机路径、benchmark、仿真宿主和试跑参数不会进 Git。
+## 机械臂能做的事
 
-## 运行
+| 你看到的选择 | 机械臂实际在做什么 |
+| --- | --- |
+| 寻找物体 | 只移动腕部相机，在当前画面、近处或更大范围里找你说的东西 |
+| 观察物体 | 再用腕部相机看一次，确认它在哪 |
+| 抓起物体 | 抓住已经看到、并且确认过的东西 |
+| 放下物体 | 把手里的东西放到选定的位置 |
+| 检查结果 | 用腕部相机确认东西是不是到了该去的地方 |
+| 微调末端 | 让手沿一个方向移动或转动一小段，例如几毫米或几度 |
+| 调整夹爪 | 张开、合上，或每次只开合一小段 |
+| 工具运动 | 拿着工具走直线、弧线，或转圈，例如在杯子里搅拌 |
 
-需要 Python 3.11 或更新版本。
+选哪一件、参数取哪一档，由 JEV 决定。动作能不能做、怎么执行，由程序和机械臂驱动完成。
+
+腕部相机看到的画面会先被整理成场景事实：桌面上有什么、大概在哪、有多确定。JEV 根据这些事实做选择，不会拿到仿真里的标准答案。
+
+## 跑起来
+
+需要 Python 3.11 或更新版本。仓库里有一张桌面场景，用来试这只机械臂。
 
 ```powershell
 python -m pip install -r requirements.txt
 copy .env.example .env
 ```
 
-在 `.env` 里填写你自己的 `AI_GATEWAY_API_KEY`，然后：
+在 `.env` 里填入你自己的 `AI_GATEWAY_API_KEY`，然后打开界面，输入你想让机械臂做的事：
 
 ```powershell
 python -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_household
 ```
 
-不打开界面：
+也可以直接给一句话：
 
 ```powershell
-python -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_household --goal "描述你想让机器人完成的事"
+python -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_household --goal "把糖盒放到红色方块上"
 ```
 
-Isaac RPC 默认连接 `127.0.0.1:47631`，可用 `JEV_ISAAC_RPC_HOST` 和 `JEV_ISAAC_RPC_PORT` 修改。仓库不包含仿真宿主。
+机械臂驱动默认连接本机 `127.0.0.1:47631`。地址和端口可以用 `JEV_ISAAC_RPC_HOST`、`JEV_ISAAC_RPC_PORT` 改。
 
-## Actions
-
-| Action | 模块 |
-| --- | --- |
-| `search_object` | `scripts/manipulation/actions/search_object.py` |
-| `observe_object` | `scripts/manipulation/actions/observe_object.py` |
-| `pick_object` | `scripts/manipulation/actions/pick_object.py` |
-| `place_object` | `scripts/manipulation/actions/place_object.py` |
-| `verify_transfer` | `scripts/manipulation/actions/verify_transfer.py` |
-| `adjust_end_effector` | `scripts/manipulation/actions/adjust_end_effector.py` |
-| `adjust_gripper` | `scripts/manipulation/actions/adjust_gripper.py` |
-| `execute_tool_motion` | `scripts/manipulation/actions/execute_tool_motion.py` |
-
-## 感知
-
-产品用的是腕部 RGB-D：
-
-- `scripts/manipulation/perception/rgbd_geometry.py`
-- `scripts/manipulation/perception/wrist_semantics.py`
-- `scripts/manipulation/perception/wrist_rgbd.json`
-
-本地如果还有试跑配置，会优先用那份。没有的话就用上面的 `wrist_rgbd.json`。CLIP 权重不进仓库；本地有 `weights/clip/ViT-B-32.pt` 就用它，否则用模型名 `ViT-B/32` 下载。
-
-## 场景
-
-`scenes/manipulation/tabletop_household_franka_wrist_rgbd_v1.usd` 和 `scenes/simple_room.usd` 是试验场景。
-
-## 记录
-
-运行记录写在 `data/jev_robot/`，这个目录不提交。
+每次运行的选择、动作结果和腕部观察会记在 `data/jev_robot/runs/`。

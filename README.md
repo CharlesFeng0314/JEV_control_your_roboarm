@@ -1,47 +1,91 @@
+**English** | [中文](README.zh.md)
+
 # JEV Control Your Roboarm
 
-你用一句话说出要做的事。JEV 看着机械臂现在能看见什么、能做什么，然后决定下一步。程序检查这个决定，让机械臂去做，做完再看一次，再交给 JEV，直到这件事做完，或者 JEV 停下来问你。
+You say what you want in one sentence. JEV controls the robot arm: it looks at what the wrist camera can support, chooses one allowed action, and the arm carries that choice out. After the arm moves, the camera looks again, a new prompt is built, and JEV chooses the next step. This repeats until the goal is checked, JEV asks you, or the turn budget runs out.
 
-JEV 不直接拧电机。它每次只选一个 **action**：机械臂被允许做的一件事，以及这件事允许范围内的参数，比如往哪边、动多少、看到什么为止。
+JEV does not send motor commands. Each turn it answers a set of closed questions. The program turns those answers into one action and a checked parameter, then the arm driver executes it.
 
-## 机械臂能做的事
+## What JEV can control the arm to do
 
-| 你看到的选择 | 机械臂实际在做什么 |
+| JEV's choice | What the arm is then allowed to do |
 | --- | --- |
-| 寻找物体 | 只移动腕部相机，在当前画面、近处或更大范围里找你说的东西 |
-| 观察物体 | 再用腕部相机看一次，确认它在哪 |
-| 抓起物体 | 抓住已经看到、并且确认过的东西 |
-| 放下物体 | 把手里的东西放到选定的位置 |
-| 检查结果 | 用腕部相机确认东西是不是到了该去的地方 |
-| 微调末端 | 让手沿一个方向移动或转动一小段，例如几毫米或几度 |
-| 调整夹爪 | 张开、合上，或每次只开合一小段 |
-| 工具运动 | 拿着工具走直线、弧线，或转圈，例如在杯子里搅拌 |
+| Search | Move only the wrist camera through the current view, a nearby set of views, or every configured safe view, and look for the named object |
+| Observe | Look again with the wrist camera and localize that object |
+| Pick | Grasp an object that this loop has already seen and checked |
+| Place | Put the held object at a selected destination |
+| Verify | Use the wrist camera to check that the transfer actually happened |
+| Nudge the hand | Translate or rotate the hand by one bounded step, such as 3 mm or 5 degrees |
+| Adjust the gripper | Hold, open, close, or change the opening by one bounded step per finger |
+| Move a tool | Hold, or follow a straight segment, an arc, or a circle, such as stirring |
+| Finish | Stop only after a later wrist observation has checked the goal |
+| Ask you | Stop and hand the decision back when the goal or the scene is still ambiguous |
 
-选哪一件、参数取哪一档，由 JEV 决定。动作能不能做、怎么执行，由程序和机械臂驱动完成。
+Which action, and which step size, is JEV's choice. Whether that choice is allowed, and how the arm moves, belongs to the program and the arm driver.
 
-腕部相机看到的画面会先被整理成场景事实：桌面上有什么、大概在哪、有多确定。JEV 根据这些事实做选择，不会拿到仿真里的标准答案。
+## How JEV did that
 
-## 跑起来
+Each turn is four steps: perceive, build JEV's prompt, control, then check.
 
-需要 Python 3.11 或更新版本。仓库里有一张桌面场景，用来试这只机械臂。
+### 1. Perceive
+
+The wrist RGB-D camera is the task camera. Depth is clustered into separate objects on the table, pixels that belong to the gripper are removed, and CLIP assigns a label, a color, and a grasp description to each cluster. That becomes the current scene snapshot: what is visible, where it is, and how confident the label is.
+
+JEV's API does not remember previous calls, so the program keeps a scene memory and replays it every turn. A new look is merged with the old record instead of replacing it. The memory keeps the object id, how many times each label was seen, the winning label, the latest pose, up to 20 past poses, the observation count, whether the object is visible now, and a stale flag. An object that stays unseen for three later looks is marked stale; it is not deleted. A spectator camera, simulator ground truth, and a validation-only flag are refused and never enter this memory.
+
+### 2. Build the prompt
+
+The prompt is rebuilt from scratch on every turn. It is not a raw image and it is not an open-ended paragraph.
+
+First the program packs a `GIVEN THAT` record:
+
+- your sentence, with surrounding whitespace removed
+- a control contract: facts come from the arm's own sensors and driver; simulator ground truth is not allowed; JEV selects the next action and its bounded arguments; validation, motion planning, and actuation stay in ordinary code
+- the live driver capabilities, including which actions this driver can actually run
+- the action list JEV may choose from, each with its description and legal inputs; if the driver advertises a subset, actions it cannot run are removed before JEV is called
+- the current wrist snapshot
+- the scene-memory view: known objects, confidences, observation counts, visibility, stale flags, unknown regions, and recent action notes
+- only the last 8 action results, not the whole history
+
+That record is what the product window shows and what the run log stores.
+
+Then the same record is split into separate typed questions. Each question has a short instruction and a closed list of answers generated from the facts above:
+
+- **Next action.** The answers are the remaining action descriptions, plus finish and ask-you. The instruction says to use only the user goal, current sensor facts, and recent results, and not to invent objects or poses.
+- **Safe to continue** and **information sufficient.** Two yes/no scores. They ask whether the step can be attempted without invented coordinates or ground truth, and whether the wrist evidence is enough for a physical action.
+- **Search target.** Answers are the vision vocabulary the driver currently advertises. Choosing a label here does not mean the object is in the scene. If the driver advertises none, the only answer is to ask you instead of inventing a class.
+- **Target and destination.** One answer is built for each object visible right now, and one for each remembered object that is not in the current view. The text includes the label, attributes, pose, observation count, and whether it is stale, and it says to look again before touching a stale or currently invisible object. Two extra answers are always present: the thing is not visible, or the evidence does not pick one object confidently.
+- **Motion size.** Hand, gripper, and tool questions use named steps (`fine`, `small`, …) whose text already states the physical size, such as 3 mm or 5 degrees. JEV cannot type an arbitrary distance.
+
+After JEV answers, ordinary code maps those names back to numbers (`fine` translation becomes 0.003 m) and drops a target or destination that JEV marked not visible or ambiguous.
+
+### 3. Control
+
+The chosen action must be one of the actions still in the catalog. The driver then runs it: search and observe move the wrist camera and read it again; pick, place, nudge, gripper, and tool motion go through the arm interface. A new wrist snapshot is taken at the start of the next turn, and the action result is written into both the prompt history and the scene memory.
+
+### 4. Check
+
+JEV may choose finish only as an answer. The program accepts that finish only when three things are already true: at least two JEV decisions have happened, some earlier action succeeded, and a wrist snapshot was taken after that success. Otherwise finish is rejected, the rejection is stored as an action result, and JEV is asked again. If JEV chooses ask-you, the loop stops for you. If none of this happens within 20 new turns, the run stops on the turn budget.
+
+## Run
+
+Python 3.11 or newer. The repository includes a tabletop scene for trying the arm.
 
 ```powershell
 python -m pip install -r requirements.txt
 copy .env.example .env
 ```
 
-在 `.env` 里填入你自己的 `AI_GATEWAY_API_KEY`，然后打开界面，输入你想让机械臂做的事：
+Put your own `AI_GATEWAY_API_KEY` in `.env`, then open the window and type the goal:
 
 ```powershell
 python -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_household
 ```
 
-也可以直接给一句话：
+Or pass the sentence directly:
 
 ```powershell
-python -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_household --goal "把糖盒放到红色方块上"
+python -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_household --goal "put the sugar box on the red block"
 ```
 
-机械臂驱动默认连接本机 `127.0.0.1:47631`。地址和端口可以用 `JEV_ISAAC_RPC_HOST`、`JEV_ISAAC_RPC_PORT` 改。
-
-每次运行的选择、动作结果和腕部观察会记在 `data/jev_robot/runs/`。
+The arm driver connects to `127.0.0.1:47631` unless `JEV_ISAAC_RPC_HOST` and `JEV_ISAAC_RPC_PORT` say otherwise. Each run records the prompt, JEV's answers, the action, and the wrist observation under `data/jev_robot/runs/`.

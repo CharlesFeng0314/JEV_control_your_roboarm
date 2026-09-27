@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -12,11 +13,18 @@ from typesafe_sdk import Choice, Noul, TypeSafeClient
 from .contracts import JevDecision
 from .manifest import ActionCatalog
 
-DEFAULT_MODEL = "typesafe-ai/jev"
-DEFAULT_BASE_URL = "https://ai-gateway.vercel.sh/typesafe"
+DEFAULT_MODEL = "jev-latest"
+DEFAULT_BASE_URL = "https://api.typesafe.ai"
+GATEWAY_MODEL = "typesafe-ai/jev"
+GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/typesafe"
 CONTROL_CHOICES = {
     "finish_task": "Finish only when robot-sensor evidence verifies the user's whole goal.",
-    "request_user": "Stop safely and ask the user when the goal or scene remains ambiguous.",
+    "request_user": (
+        "Ask the user only when their language is ambiguous, conflicting perceived candidates "
+        "cannot be resolved autonomously, or a completed wide robot-mounted search still cannot "
+        "find a required object. A target missing from the current view alone requires search, "
+        "not user clarification."
+    ),
 }
 TRANSLATION_STEPS = {
     "none": 0.0,
@@ -27,7 +35,6 @@ TRANSLATION_STEPS = {
     "large": 0.025,
 }
 ROTATION_STEPS = {"none": 0.0, "micro": 1.0, "fine": 3.0, "small": 5.0, "medium": 15.0}
-GRIPPER_STEPS = {"none": 0.0, "micro": 0.0005, "fine": 0.001, "small": 0.002, "medium": 0.005}
 TOOL_RADII = {
     "none": 0.0,
     "micro": 0.003,
@@ -45,6 +52,7 @@ TOOL_REVOLUTIONS = {
     "three": 3.0,
 }
 AXIAL_STEPS = {"none": 0.0, "micro": 0.001, "fine": 0.003, "small": 0.005, "medium": 0.010}
+PLACEMENT_CLEARANCES = {"contact": 0.0, "close": 0.005, "safe": 0.020}
 
 
 def _candidate_criteria(state: Mapping[str, Any], *, destination: bool) -> dict[str, str]:
@@ -102,17 +110,73 @@ def _perception_label_criteria(state: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def _search_scope_criteria(state: Mapping[str, Any]) -> dict[str, str]:
+    recent = state.get("recent_action_results") or []
+    failed_scopes = [
+        str((item.get("data") or {}).get("search_scope"))
+        for item in recent
+        if item.get("action") == "search_object" and not item.get("success")
+    ]
+    history = ", ".join(failed_scopes) if failed_scopes else "none"
+    history_note = f" Recent failed scopes: {history}."
+    return {
+        "current_view": (
+            "Do not move; inspect only the current robot-mounted camera view. Choose this only "
+            "when this view has not already failed for the requested target." + history_note
+        ),
+        "narrow": (
+            "Inspect a bounded nearby subset of robot-mounted camera viewpoints. Prefer this "
+            "after current_view has failed for the requested target." + history_note
+        ),
+        "wide": (
+            "Inspect all configured safe robot-mounted camera viewpoints. Prefer this after a "
+            "narrow search has failed, or when the remembered scene remains substantially "
+            "unobserved." + history_note
+        ),
+    }
+
+
 def build_questions(
     state: Mapping[str, Any],
     catalog: ActionCatalog,
 ) -> dict[str, Noul | Choice]:
     action_criteria = catalog.choice_criteria()
+    if "search_object" in action_criteria:
+        action_criteria["search_object"] += (
+            " Use this when a required object is not visible in the current wrist view; expand "
+            "the bounded robot-mounted search using recent failed-scope feedback before asking "
+            "the user."
+        )
     action_criteria.update(CONTROL_CHOICES)
+    recent = state.get("recent_action_results") or []
+    failed_wide_searches = sum(
+        1
+        for item in recent
+        if item.get("action") == "search_object"
+        and not item.get("success")
+        and (item.get("data") or {}).get("search_scope") == "wide"
+    )
+    if failed_wide_searches:
+        evidence = (
+            f" Robot feedback contains {failed_wide_searches} completed failed wide search(es) "
+            "with no accepted target."
+        )
+        action_criteria["search_object"] += (
+            evidence
+            + " Do not repeat wide search unless the scene, target description, or configured "
+            "viewpoints changed."
+        )
+        action_criteria["request_user"] += (
+            evidence
+            + " With unchanged evidence, asking the user is the information-gaining next step."
+        )
     return {
         "next_action": Choice(
             instructions=(
                 "Choose exactly one next high-level action. Use only current robot-sensor facts, "
-                "the user goal, and recent action results. Do not invent scene objects or poses."
+                "the user goal, and recent action results. Do not invent scene objects or poses. "
+                "Missing current-view evidence is a reason to search autonomously, not by itself "
+                "a reason to ask the user."
             ),
             criteria=action_criteria,
         ),
@@ -126,12 +190,11 @@ def build_questions(
             instructions="Are current robot-mounted observations sufficient for a physical action?",
         ),
         "search_scope": Choice(
-            instructions="If searching is needed, choose the smallest adequate search scope.",
-            criteria={
-                "current_view": "Do not move; inspect only the current robot-mounted camera view.",
-                "narrow": "Inspect a bounded nearby subset of robot-mounted camera viewpoints.",
-                "wide": "Inspect all configured safe robot-mounted camera viewpoints.",
-            },
+            instructions=(
+                "Choose the smallest search scope that makes new perceptual progress. Do not "
+                "repeat a failed scope when the robot feedback shows no new target evidence."
+            ),
+            criteria=_search_scope_criteria(state),
         ),
         "search_target": Choice(
             instructions=(
@@ -147,6 +210,55 @@ def build_questions(
         "destination_candidate": Choice(
             instructions="Ground the user's requested destination in current visible evidence.",
             criteria=_candidate_criteria(state, destination=True),
+        ),
+        "place_relation": Choice(
+            instructions="Choose the spatial relation the placed target must satisfy.",
+            criteria={
+                "on": "Place the target on the destination's observed top surface.",
+                "inside": "Place the target inside the observed destination bounds.",
+                "next_to": "Place beside the destination using the smallest collision-free gap.",
+                "left_of": "Place on the robot-base negative-X side of the destination.",
+                "right_of": "Place on the robot-base positive-X side of the destination.",
+                "in_front_of": "Place on the robot-base negative-Y side of the destination.",
+                "behind": "Place on the robot-base positive-Y side of the destination.",
+                "at_destination": "Place at the destination candidate's observed pose.",
+            },
+        ),
+        "placement_clearance": Choice(
+            instructions="Choose the smallest adequate geometric clearance.",
+            criteria={
+                "contact": "0 mm nominal gap; use for supported contact such as on/inside.",
+                "close": "5 mm nominal gap.",
+                "safe": "20 mm nominal gap for conservative separation.",
+            },
+        ),
+        "placement_offset_axis": Choice(
+            instructions="Choose one optional robot-base offset axis after relation solving.",
+            criteria={
+                "none": "No offset.",
+                "x": "Offset along X.",
+                "y": "Offset along Y.",
+                "z": "Offset along Z.",
+            },
+        ),
+        "placement_offset_direction": Choice(
+            instructions="Choose the optional placement offset direction.",
+            criteria={
+                "none": "No offset.",
+                "positive": "Positive axis.",
+                "negative": "Negative axis.",
+            },
+        ),
+        "placement_offset_step": Choice(
+            instructions="Choose a bounded optional placement offset.",
+            criteria={
+                "none": "0 mm.",
+                "micro": "1 mm.",
+                "fine": "3 mm.",
+                "small": "5 mm.",
+                "medium": "10 mm.",
+                "large": "25 mm maximum.",
+            },
         ),
         "control_frame": Choice(
             instructions="Choose the coordinate frame for a bounded fine or tool motion.",
@@ -213,23 +325,13 @@ def build_questions(
             },
         ),
         "gripper_command": Choice(
-            instructions="Choose one bounded gripper adjustment.",
+            instructions=(
+                "Choose one complete gripper action. Finger motion is binary: grasp closes "
+                "toward contact and release opens fully; never split it into incremental steps."
+            ),
             criteria={
-                "hold": "Keep the current aperture.",
-                "open": "Open from a closed state.",
-                "close": "Close toward contact.",
-                "widen": "Increase aperture by one selected increment.",
-                "narrow": "Decrease aperture by one selected increment.",
-            },
-        ),
-        "gripper_step": Choice(
-            instructions="Choose the per-finger gripper increment.",
-            criteria={
-                "none": "0 mm.",
-                "micro": "0.5 mm.",
-                "fine": "1 mm.",
-                "small": "2 mm.",
-                "medium": "5 mm maximum.",
+                "grasp": "Close once toward contact/force limit to grasp.",
+                "release": "Open once to the validated full-open aperture to release.",
             },
         ),
         "tool_primitive": Choice(
@@ -312,9 +414,79 @@ def build_questions(
     }
 
 
+DECISION_QUESTION_KEYS = ("next_action", "safe_to_continue", "information_sufficient")
+ACTION_QUESTION_KEYS: dict[str, tuple[str, ...]] = {
+    "search_object": ("search_target", "search_scope"),
+    "observe_object": ("search_target", "target_candidate"),
+    "pick_object": ("target_candidate",),
+    "place_object": (
+        "target_candidate",
+        "destination_candidate",
+        "place_relation",
+        "placement_clearance",
+        "placement_offset_axis",
+        "placement_offset_direction",
+        "placement_offset_step",
+    ),
+    "verify_transfer": (
+        "target_candidate",
+        "destination_candidate",
+        "place_relation",
+        "placement_clearance",
+        "placement_offset_axis",
+        "placement_offset_direction",
+        "placement_offset_step",
+    ),
+    "adjust_end_effector": (
+        "target_candidate",
+        "control_frame",
+        "translation_axis",
+        "translation_direction",
+        "translation_step",
+        "rotation_axis",
+        "rotation_direction",
+        "rotation_step",
+        "speed_profile",
+        "stop_condition",
+    ),
+    "adjust_gripper": ("gripper_command", "gripper_stop_condition"),
+    "execute_tool_motion": (
+        "target_candidate",
+        "control_frame",
+        "tool_primitive",
+        "tool_plane",
+        "rotation_direction",
+        "tool_radius",
+        "tool_revolutions",
+        "axial_step",
+        "speed_profile",
+        "stop_condition",
+    ),
+}
+
+
+def build_decision_questions(
+    state: Mapping[str, Any], catalog: ActionCatalog
+) -> dict[str, Noul | Choice]:
+    all_questions = build_questions(state, catalog)
+    return {key: all_questions[key] for key in DECISION_QUESTION_KEYS}
+
+
+def build_argument_questions(
+    action: str, state: Mapping[str, Any], catalog: ActionCatalog
+) -> dict[str, Noul | Choice]:
+    all_questions = build_questions(state, catalog)
+    return {key: all_questions[key] for key in ACTION_QUESTION_KEYS.get(action, ())}
+
+
+def _answer_choice(answers: Mapping[str, Any], key: str, default: str) -> str:
+    answer = answers.get(key)
+    return str(answer.choice) if answer is not None else default
+
+
 def bounded_arguments(action: str, answers: Mapping[str, Any]) -> dict[str, Any]:
-    target = str(answers["target_candidate"].choice)
-    destination = str(answers["destination_candidate"].choice)
+    target = _answer_choice(answers, "target_candidate", "target_not_visible")
+    destination = _answer_choice(answers, "destination_candidate", "destination_not_visible")
     arguments: dict[str, Any] = {
         "target_ref": None if target.endswith(("_not_visible", "_ambiguous")) else target,
         "destination_ref": (
@@ -322,9 +494,13 @@ def bounded_arguments(action: str, answers: Mapping[str, Any]) -> dict[str, Any]
         ),
     }
     if action in {"search_object", "observe_object"}:
-        arguments["target_label"] = str(answers["search_target"].choice)
+        arguments["target_label"] = _answer_choice(
+            answers, "search_target", "unknown_target"
+        )
         if action == "search_object":
-            arguments["search_scope"] = str(answers["search_scope"].choice)
+            arguments["search_scope"] = _answer_choice(
+                answers, "search_scope", "current_view"
+            )
     elif action == "adjust_end_effector":
         arguments.update(
             {
@@ -343,7 +519,6 @@ def bounded_arguments(action: str, answers: Mapping[str, Any]) -> dict[str, Any]
         arguments.update(
             {
                 "command": str(answers["gripper_command"].choice),
-                "step_m": GRIPPER_STEPS[str(answers["gripper_step"].choice)],
                 "stop_condition": str(answers["gripper_stop_condition"].choice),
             }
         )
@@ -359,6 +534,16 @@ def bounded_arguments(action: str, answers: Mapping[str, Any]) -> dict[str, Any]
                 "axial_step_m": AXIAL_STEPS[str(answers["axial_step"].choice)],
                 "speed_profile": str(answers["speed_profile"].choice),
                 "stop_condition": str(answers["stop_condition"].choice),
+            }
+        )
+    elif action in {"place_object", "verify_transfer"}:
+        arguments.update(
+            {
+                "relation": str(answers["place_relation"].choice),
+                "clearance_m": PLACEMENT_CLEARANCES[str(answers["placement_clearance"].choice)],
+                "offset_axis": str(answers["placement_offset_axis"].choice),
+                "offset_direction": str(answers["placement_offset_direction"].choice),
+                "offset_m": TRANSLATION_STEPS[str(answers["placement_offset_step"].choice)],
             }
         )
     return arguments
@@ -386,6 +571,14 @@ class DecisionEngine(Protocol):
     def decide(self, state: Mapping[str, Any], catalog: ActionCatalog) -> JevDecision: ...
 
 
+@dataclass(frozen=True)
+class JevApiSettings:
+    api_key: str
+    model: str
+    base_url: str
+    provider: str
+
+
 class JevDecisionEngine:
     def __init__(
         self,
@@ -407,13 +600,29 @@ class JevDecisionEngine:
             model=self.model,
             base_url=self.base_url,
         ) as client:
-            response = client.system_one(
-                state=dict(state), questions=build_questions(state, catalog)
+            decision_response = client.system_one(
+                state=dict(state), questions=build_decision_questions(state, catalog)
             )
+            decision_answers = decision_response.answers
+            action = str(decision_answers["next_action"].choice)
+            argument_questions = build_argument_questions(action, state, catalog)
+            argument_answers: Mapping[str, Any] = {}
+            if argument_questions:
+                parameter_state = dict(state)
+                parameter_state["selected_next_action"] = action
+                parameter_state["parameter_selection_contract"] = (
+                    "Select only the bounded arguments for selected_next_action. Use recent "
+                    "robot feedback to make perceptual or motion progress; do not repeat a "
+                    "failed parameter choice without new evidence."
+                )
+                argument_response = client.system_one(
+                    state=parameter_state,
+                    questions=argument_questions,
+                )
+                argument_answers = argument_response.answers
         latency_ms = (time.perf_counter() - started) * 1000.0
-        answers = response.answers
+        answers = {**decision_answers, **argument_answers}
         next_answer = answers["next_action"]
-        action = str(next_answer.choice)
         confidence = float(next_answer.confidence)
         safe = float(answers["safe_to_continue"].noul)
         sufficient = float(answers["information_sufficient"].noul)
@@ -438,11 +647,31 @@ class JevDecisionEngine:
         )
 
 
-def load_api_key(path: Path) -> str:
+def load_api_settings(path: Path) -> JevApiSettings:
+    values: dict[str, str] = {}
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         for name in ("AI_GATEWAY_API_KEY", "TYPESAFE_API_KEY"):
             prefix = f"{name}="
             if line.startswith(prefix) and line[len(prefix) :].strip():
-                return line[len(prefix) :].strip()
+                values[name] = line[len(prefix) :].strip()
+    if values.get("TYPESAFE_API_KEY"):
+        return JevApiSettings(
+            api_key=values["TYPESAFE_API_KEY"],
+            model=DEFAULT_MODEL,
+            base_url=DEFAULT_BASE_URL,
+            provider="typesafe_official",
+        )
+    if values.get("AI_GATEWAY_API_KEY"):
+        return JevApiSettings(
+            api_key=values["AI_GATEWAY_API_KEY"],
+            model=GATEWAY_MODEL,
+            base_url=GATEWAY_BASE_URL,
+            provider="vercel_ai_gateway",
+        )
     raise RuntimeError(f"No JEV API key is configured in {path}")
+
+
+def load_api_key(path: Path) -> str:
+    """Backward-compatible key-only loader."""
+    return load_api_settings(path).api_key

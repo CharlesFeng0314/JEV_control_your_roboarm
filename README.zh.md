@@ -100,10 +100,10 @@ JEV 决策后端  vs  LLM 决策后端
 | 寻找 | 只移动腕部相机，在配置好的安全视角里找指定物体 |
 | 观察 | 再看一次并重新定位目标 |
 | 抓取 | 抓取已经被当前闭环看见并检查过的物体 |
-| 放置 | 把手里的物体放到选定目标位置 |
-| 核对 | 再次观察，检查预期转移是否真的发生 |
+| 放置 | 按 JEV 选择的 on、inside、next_to、方向关系或有限偏移放置手中物体 |
+| 核对 | 重新观察目标和目的地，验证所选空间关系 |
 | 微调手 | 只沿一个方向平移/旋转一档，例如 3 mm 或 5° |
-| 调整夹爪 | 保持、张开、闭合，或改变一档开合量 |
+| 调整夹爪 | 一次闭合到接触以抓起，或一次完全张开以释放；不再做手指微步进 |
 | 工具运动 | 保持、走直线、圆弧或圆周，例如搅拌 |
 | 结束 | 在后续观察已经核对目标后请求结束 |
 | 问你 | 目标或场景仍有歧义时停止并把决定交还给用户 |
@@ -128,11 +128,13 @@ JEV 决策后端  vs  LLM 决策后端
 - [x] 腕部 RGB-D 感知链路
 - [x] 当前 scene snapshot + 持久 scene memory
 - [x] 根据场景和 driver capability 动态生成 JEV choices
-- [x] 有边界的手部 / 夹爪 / 工具动作参数
+- [x] 有边界的末端 / 工具动作参数，以及二值抓起 / 放开控制
 - [x] 用普通代码拒绝 unsupported 或信息不足的动作
 - [x] 动作后重新观察
 - [x] finish gate 和 turn budget
 - [x] Isaac Sim RPC driver 路径
+- [x] 动态 pick/place RPC、JEV 空间关系选择和腕部视觉验证
+- [x] 产品化本地 Web 界面按“题目 → choices → JEV’s choice”展示，完整 JSON 仅保留在运行归档
 - [x] 每次运行记录 prompt、JEV 回答、动作和腕部观察
 
 下一步：
@@ -154,19 +156,33 @@ copy .env.example .env
 
 在 `.env` 中填写自己的 `AI_GATEWAY_API_KEY`。
 
-当前可运行路径要求 Isaac RPC driver 已经可用。打开应用并输入任务：
+当前产品由两个常驻进程组成。请打开两个 PowerShell 窗口，并都先进入项目目录。
+
+**终端 A — 启动 Isaac Sim 与机械臂 RPC 服务：**
 
 ```powershell
-python -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_household
+cd H:\robo
+H:\robo\.conda-isaacsim\python.exe -u scripts\manipulation\simulation\isaac_scene_host.py --config scripts\manipulation\config\tabletop_household_franka_wrist_rgbd_v1.json --output data\manipulation\scene_hosts\tabletop_franka_live --port 47631
 ```
 
-也可以直接传入一句任务：
+这一个命令会同时打开 Isaac Sim GUI，并在 `127.0.0.1:47631` 提供场景、物理、机械臂状态和腕部 RGB-D 服务，不需要再启动第三个服务。保持这个终端和 Isaac 窗口常驻。
+
+**终端 B — 启动 JEV Web 控制台：**
 
 ```powershell
-python -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_household --goal "把糖盒放到红色方块上"
+cd H:\robo
+H:\robo\.conda\python.exe -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_franka_live
 ```
 
-默认连接 `127.0.0.1:47631`，也可以用 `JEV_ISAAC_RPC_HOST` 和 `JEV_ISAAC_RPC_PORT` 修改。
+浏览器会打开本地控制台。页面中的 **Wrist camera** 从 `NO WRIST SIGNAL` 变成 `LIVE`，就表示 Sim 与 RPC 已接通；它会持续显示机械腕部 RGB 画面。输入任务并点击 **Start fresh run**，每次都会从 turn 1 开始。
+
+也可以不打开 Web 页面，直接运行一句任务：
+
+```powershell
+H:\robo\.conda\python.exe -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_franka_live --goal "把糖盒放到红色方块上"
+```
+
+默认连接 `127.0.0.1:47631`；真机或远端服务可用 `JEV_ISAAC_RPC_HOST` 和 `JEV_ISAAC_RPC_PORT` 修改。停止时先在终端 B 按 `Ctrl+C`，再关闭终端 A / Isaac Sim。
 
 每次运行的 prompt、JEV 回答、选择动作和腕部观察记录在：
 

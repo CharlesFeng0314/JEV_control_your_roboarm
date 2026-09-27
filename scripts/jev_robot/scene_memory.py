@@ -148,12 +148,8 @@ class SceneMemory:
                 {
                     "object_id": record["object_id"],
                     "label": record["label"],
-                    "description": (record.get("latest_observation") or {}).get(
-                        "description"
-                    ),
-                    "attributes": (record.get("latest_observation") or {}).get(
-                        "attributes", {}
-                    ),
+                    "description": (record.get("latest_observation") or {}).get("description"),
+                    "attributes": (record.get("latest_observation") or {}).get("attributes", {}),
                     "bbox3d_world_m": (record.get("latest_observation") or {}).get(
                         "bbox3d_world_m"
                     ),

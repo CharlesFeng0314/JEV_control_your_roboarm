@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .action_bridge import ActionBridge
-from .choices import DecisionEngine
+from .choices import CONTROL_CHOICES, DecisionEngine
 from .contracts import ActionOutcome, JevDecision, SessionResult
 from .events import EventSink, NullEventSink
 from .manifest import ActionCatalog
@@ -95,6 +95,28 @@ class ProductOrchestrator:
             self.sink.emit(
                 "given_that_ready",
                 {"turn": turn, "state": state, "rendered": render_given_that(state)},
+            )
+            choices = [
+                {
+                    "name": action["name"],
+                    "description": action["description"],
+                }
+                for action in state["available_actions"]
+            ]
+            choices.extend(
+                {"name": name, "description": description}
+                for name, description in CONTROL_CHOICES.items()
+            )
+            self.sink.emit(
+                "jev_question",
+                {
+                    "turn": turn,
+                    "question": (
+                        "Given the goal and current sensor evidence, "
+                        "what should the robot do next?"
+                    ),
+                    "choices": choices,
+                },
             )
             decision = self.engine.decide(state, self.catalog)
             decisions.append(decision)

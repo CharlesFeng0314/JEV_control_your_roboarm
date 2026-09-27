@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import socket
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from scripts.manipulation.perception.wrist_semantics import WristRgbdSemanticPerception
 
@@ -31,9 +35,7 @@ _LOCAL_CONFIG = (
     / "config"
     / "tabletop_household_franka_wrist_rgbd_v1.json"
 )
-_BUNDLED_CONFIG = (
-    PROJECT_ROOT / "scripts" / "manipulation" / "perception" / "wrist_rgbd.json"
-)
+_BUNDLED_CONFIG = PROJECT_ROOT / "scripts" / "manipulation" / "perception" / "wrist_rgbd.json"
 DEFAULT_CONFIG = _LOCAL_CONFIG if _LOCAL_CONFIG.is_file() else _BUNDLED_CONFIG
 ARM_JOINTS = tuple(f"panda_joint{index}" for index in range(1, 8))
 SEARCH_ARM_POSES = (
@@ -66,6 +68,87 @@ class PerceptionProvider(Protocol):
 
     def detect(self, packet: dict[str, Any]) -> list[dict[str, Any]]: ...
 
+    def close(self) -> None: ...
+
+
+_LIVE_SENSOR_LOCK = threading.Lock()
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_ENDING = b"IEND\xaeB`\x82"
+_NPY_SIGNATURE = b"\x93NUMPY"
+
+
+class IncompleteSensorFrame(RuntimeError):
+    """A wrist frame was read while the scene host was still replacing it."""
+
+
+def _complete_png(data: bytes) -> bool:
+    return (
+        len(data) >= len(_PNG_SIGNATURE) + len(_PNG_ENDING)
+        and data.startswith(_PNG_SIGNATURE)
+        and data.endswith(_PNG_ENDING)
+    )
+
+
+def _complete_npy(data: bytes) -> bool:
+    if len(data) < 10 or not data.startswith(_NPY_SIGNATURE):
+        return False
+    major = data[6]
+    if major == 1:
+        header_len = int.from_bytes(data[8:10], "little")
+        return len(data) >= 10 + header_len
+    if major == 2 and len(data) >= 12:
+        header_len = int.from_bytes(data[8:12], "little")
+        return len(data) >= 12 + header_len
+    return False
+
+
+def _read_file_bytes(path: Path) -> bytes:
+    return path.read_bytes()
+
+
+def _snapshot_sensor_bytes(packet: dict[str, Any]) -> tuple[bytes | None, bytes | None]:
+    rgb_path = Path(str(packet.get("rgb_path") or ""))
+    depth_path = Path(str(packet.get("depth_path") or ""))
+    rgb = _read_file_bytes(rgb_path) if rgb_path.is_file() else None
+    depth = _read_file_bytes(depth_path) if depth_path.is_file() else None
+    if rgb is not None and not _complete_png(rgb):
+        raise IncompleteSensorFrame("The wrist RGB frame was still being written.")
+    if depth is not None and not _complete_npy(depth):
+        raise IncompleteSensorFrame("The wrist depth frame was still being written.")
+    return rgb, depth
+
+
+def read_stable_rgbd(
+    capture: Callable[[], dict[str, Any]],
+    *,
+    attempts: int = 4,
+) -> dict[str, Any]:
+    """Capture RGB-D and copy its files before another client can replace them.
+
+    The scene host publishes one shared live path. The web preview and JEV
+    perception both request frames, so the file read has to finish before the
+    next request is allowed to overwrite that path.
+    """
+
+    last_error: Exception | None = None
+    for _attempt in range(max(1, attempts)):
+        with _LIVE_SENSOR_LOCK:
+            packet = dict(capture())
+            try:
+                rgb, depth = _snapshot_sensor_bytes(packet)
+            except (IncompleteSensorFrame, OSError) as exc:
+                last_error = exc
+            else:
+                if rgb is not None:
+                    packet["rgb_bytes"] = rgb
+                if depth is not None:
+                    packet["depth_bytes"] = depth
+                return packet
+        time.sleep(0.02)
+    raise IncompleteSensorFrame(
+        "The wrist RGB-D frame changed while the camera preview and perception were reading it."
+    ) from last_error
+
 
 def _socket_rpc(
     host: str,
@@ -91,6 +174,28 @@ def _socket_rpc(
     if not isinstance(value, dict):
         raise TypeError("Isaac scene host response must be a JSON object")
     return value
+
+
+def create_wrist_frame_source(
+    host: str | None = None,
+    port: int | None = None,
+    *,
+    timeout: float = 30.0,
+) -> Callable[[], dict[str, Any]]:
+    """Return a lightweight RGB-D source without loading the perception model."""
+
+    selected_host = host or os.environ.get("JEV_ISAAC_RPC_HOST", DEFAULT_HOST)
+    selected_port = int(port or os.environ.get("JEV_ISAAC_RPC_PORT", str(DEFAULT_PORT)))
+
+    def capture() -> dict[str, Any]:
+        packet = read_stable_rgbd(
+            lambda: _socket_rpc(selected_host, selected_port, {"cmd": "rgbd"}, timeout)
+        )
+        if not packet.get("rgb_bytes"):
+            raise FileNotFoundError("The wrist RGB frame is not available yet.")
+        return packet
+
+    return capture
 
 
 class IsaacRpcDriver:
@@ -120,6 +225,7 @@ class IsaacRpcDriver:
         self._held_target: dict[str, Any] | None = None
         self._active_destination: dict[str, Any] | None = None
         self._expected_place_position: tuple[float, float, float] | None = None
+        self._place_parameters: dict[str, Any] | None = None
 
     def _call(self, payload: dict[str, Any], timeout: float = 120.0) -> dict[str, Any]:
         if self._transport is None:
@@ -147,7 +253,7 @@ class IsaacRpcDriver:
                 "place_object",
                 "verify_transfer",
             ],
-            "unsupported_until_rpc_extension": [
+            "not_implemented_by_this_driver": [
                 "adjust_end_effector",
                 "execute_tool_motion",
             ],
@@ -156,22 +262,35 @@ class IsaacRpcDriver:
 
     def _archive_rgbd(self, packet: dict[str, Any]) -> dict[str, Any]:
         self._sensor_sequence += 1
+        archived = {
+            key: value
+            for key, value in packet.items()
+            if key not in {"rgb_bytes", "depth_bytes"}
+        }
         if self._run_dir is None:
-            return packet
+            return archived
         artifact_dir = self._run_dir / "artifacts" / "wrist_rgbd"
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        archived = dict(packet)
+        payloads = {
+            "rgb_path": packet.get("rgb_bytes"),
+            "depth_path": packet.get("depth_bytes"),
+        }
         for key, suffix in (("rgb_path", ".png"), ("depth_path", ".npy")):
-            source = Path(str(packet.get(key) or ""))
-            if not source.is_file():
+            payload = payloads[key]
+            if not isinstance(payload, (bytes, bytearray)) or not payload:
                 continue
             destination = artifact_dir / f"{self._sensor_sequence:06d}_{key}{suffix}"
-            shutil.copy2(source, destination)
+            destination.write_bytes(bytes(payload))
             archived[key] = str(destination)
+        metadata_path = artifact_dir / f"{self._sensor_sequence:06d}_packet.json"
+        metadata_path.write_text(
+            json.dumps(archived, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         return archived
 
     def _capture_rgbd(self) -> dict[str, Any]:
-        return self._archive_rgbd(self._call({"cmd": "rgbd"}, timeout=180.0))
+        packet = read_stable_rgbd(lambda: self._call({"cmd": "rgbd"}, timeout=180.0))
+        return self._archive_rgbd(packet)
 
     def snapshot(self) -> SceneSnapshot:
         state = self._call({"cmd": "state"})
@@ -209,32 +328,45 @@ class IsaacRpcDriver:
         return tuple(float(value) for value in raw)
 
     def _track_observations(self, observations: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
-        tracked = []
-        for item in observations:
-            observation = dict(item)
-            position = self._position(observation)
-            best_id = None
-            best_distance = CACHE_MATCH_RADIUS_M
-            if position is not None:
-                for object_id, previous in self._object_tracks.items():
-                    previous_position = self._position(previous)
-                    if previous_position is None:
-                        continue
-                    distance = (
+        current = [dict(item) for item in observations]
+        previous = [
+            (object_id, position)
+            for object_id, item in self._object_tracks.items()
+            if (position := self._position(item)) is not None
+        ]
+        assignments: dict[int, str] = {}
+        if current and previous:
+            costs = np.full((len(current), len(previous)), 1e6, dtype=np.float64)
+            for row, observation in enumerate(current):
+                position = self._position(observation)
+                if position is None:
+                    continue
+                for col, (_object_id, old_position) in enumerate(previous):
+                    costs[row, col] = (
                         sum(
-                            (current - old) ** 2
-                            for current, old in zip(position, previous_position, strict=True)
+                            (value - old) ** 2
+                            for value, old in zip(position, old_position, strict=True)
                         )
                         ** 0.5
                     )
-                    if distance <= best_distance:
-                        best_id = object_id
-                        best_distance = distance
+            rows, cols = linear_sum_assignment(costs)
+            for row, col in zip(rows.tolist(), cols.tolist(), strict=True):
+                if costs[row, col] <= CACHE_MATCH_RADIUS_M:
+                    assignments[row] = previous[col][0]
+
+        tracked = []
+        for index, observation in enumerate(current):
+            best_id = assignments.get(index)
             if best_id is None:
                 best_id = f"wrist_object_{self._next_object_id:03d}"
                 self._next_object_id += 1
             observation["object_id"] = best_id
             observation["sensor_sequence"] = self._sensor_sequence
+            fuse = getattr(self._perception, "fuse_tracked_observation", None)
+            if callable(fuse):
+                observation = fuse(best_id, observation)
+                observation["object_id"] = best_id
+                observation["sensor_sequence"] = self._sensor_sequence
             self._object_tracks[best_id] = observation
             tracked.append(observation)
         self._visible_objects = tuple(tracked)
@@ -330,49 +462,34 @@ class IsaacRpcDriver:
 
     def _adjust_gripper(self, arguments: dict[str, Any]) -> ActionOutcome:
         command = str(arguments.get("command") or "")
-        step_m = float(arguments.get("step_m") or 0.0)
-        if command not in {"hold", "open", "close", "widen", "narrow"}:
+        if command not in {"grasp", "release"}:
             raise ValueError(f"Unsupported gripper command {command!r}")
-        if not 0.0 <= step_m <= 0.005:
-            raise ValueError("Gripper step must be within 0-5 mm per finger")
-        if (command == "hold") != (step_m == 0.0):
-            raise ValueError("Only hold may use a zero step; moving commands require a step")
 
         state = self._call({"cmd": "state"})
         current_m = self._finger_width(state)
-        direction = 0.0 if command == "hold" else 1.0
-        if command in {"close", "narrow"}:
-            direction = -1.0
-        target_m = min(0.04, max(0.0, current_m + direction * step_m))
-        if command != "hold" and abs(target_m - current_m) < 1e-6:
+        target_m = 0.0 if command == "grasp" else 0.04
+        if abs(target_m - current_m) < 1e-6:
             return ActionOutcome(
                 action="adjust_gripper",
-                success=False,
-                message="Gripper is already at the requested mechanical limit",
+                success=True,
+                message=f"Gripper already satisfies {command}",
                 data={
                     "command": command,
-                    "step_m": step_m,
                     "current_per_finger_m": current_m,
                     "target_per_finger_m": target_m,
                     "stop_condition": arguments.get("stop_condition"),
                 },
             )
-        if command != "hold":
-            self._call(
-                {"cmd": "set_gripper", "width": target_m, "steps": 40},
-                timeout=180.0,
-            )
+        self._call(
+            {"cmd": "set_gripper", "width": target_m, "steps": 40},
+            timeout=180.0,
+        )
         return ActionOutcome(
             action="adjust_gripper",
             success=True,
-            message=(
-                "Gripper held at its current aperture"
-                if command == "hold"
-                else f"Gripper moved from {current_m:.4f} m to {target_m:.4f} m per finger"
-            ),
+            message=f"Gripper completed {command}",
             data={
                 "command": command,
-                "step_m": step_m,
                 "current_per_finger_m": current_m,
                 "target_per_finger_m": target_m,
                 "stop_condition": arguments.get("stop_condition"),
@@ -411,23 +528,80 @@ class IsaacRpcDriver:
         )
 
     @classmethod
-    def _stack_place_position(
+    def _resolve_place_position(
         cls,
         target: dict[str, Any],
         destination: dict[str, Any],
+        arguments: dict[str, Any],
     ) -> tuple[float, float, float]:
         target_min, target_max = cls._bounds(target)
         destination_min, destination_max = cls._bounds(destination)
-        del destination_min
-        target_height = max(target_max[2] - target_min[2], 0.015)
         center = cls._position(destination)
         if center is None:
             raise ValueError("Destination has no wrist-observed position")
-        return (
-            center[0],
-            center[1],
-            destination_max[2] + target_height / 2.0 + 0.005,
+        relation = str(arguments.get("relation") or "")
+        supported = {
+            "on",
+            "inside",
+            "next_to",
+            "left_of",
+            "right_of",
+            "in_front_of",
+            "behind",
+            "at_destination",
+        }
+        if relation not in supported:
+            raise ValueError(f"Unsupported placement relation {relation!r}")
+        clearance = float(arguments.get("clearance_m") or 0.0)
+        if clearance not in {0.0, 0.005, 0.020}:
+            raise ValueError("Placement clearance is outside the bounded choices")
+        target_half = tuple(
+            max((high - low) / 2.0, 0.0075)
+            for low, high in zip(target_min, target_max, strict=True)
         )
+        destination_half = tuple(
+            max((high - low) / 2.0, 0.0075)
+            for low, high in zip(destination_min, destination_max, strict=True)
+        )
+        position = [center[0], center[1], target_min[2] + target_half[2]]
+        if relation == "on":
+            position[2] = destination_max[2] + target_half[2] + clearance
+        elif relation == "inside":
+            if any(
+                2.0 * target_half[index] + 2.0 * clearance > 2.0 * destination_half[index]
+                for index in (0, 1)
+            ):
+                raise ValueError("Observed target does not fit inside destination bounds")
+            position[2] = destination_min[2] + target_half[2] + clearance
+        elif relation in {"next_to", "right_of"}:
+            position[0] += destination_half[0] + target_half[0] + clearance
+        elif relation == "left_of":
+            position[0] -= destination_half[0] + target_half[0] + clearance
+        elif relation == "in_front_of":
+            position[1] -= destination_half[1] + target_half[1] + clearance
+        elif relation == "behind":
+            position[1] += destination_half[1] + target_half[1] + clearance
+        elif relation == "at_destination":
+            position = list(center)
+
+        axis = str(arguments.get("offset_axis") or "none")
+        direction = str(arguments.get("offset_direction") or "none")
+        offset = float(arguments.get("offset_m") or 0.0)
+        if axis not in {"none", "x", "y", "z"} or direction not in {
+            "none",
+            "positive",
+            "negative",
+        }:
+            raise ValueError("Unsupported placement offset choice")
+        if offset not in {0.0, 0.001, 0.003, 0.005, 0.010, 0.025}:
+            raise ValueError("Placement offset is outside the bounded choices")
+        if (axis == "none" or direction == "none") != (offset == 0.0):
+            raise ValueError("Placement offset axis/direction and distance are inconsistent")
+        if offset:
+            position[{"x": 0, "y": 1, "z": 2}[axis]] += (
+                offset if direction == "positive" else -offset
+            )
+        return tuple(position)
 
     @staticmethod
     def _failed_motion(action: str, state: dict[str, Any]) -> ActionOutcome:
@@ -509,7 +683,7 @@ class IsaacRpcDriver:
             role="Destination",
             fresh=True,
         )
-        place_position = self._stack_place_position(self._held_target, destination)
+        place_position = self._resolve_place_position(self._held_target, destination, arguments)
         self._call({"cmd": "set_place", "position": list(place_position)})
         last_state: dict[str, Any] = {}
         for _ in range(MAX_MANIPULATION_STEPS):
@@ -519,6 +693,16 @@ class IsaacRpcDriver:
             if last_state.get("done"):
                 self._active_destination = dict(destination)
                 self._expected_place_position = place_position
+                self._place_parameters = {
+                    key: arguments.get(key)
+                    for key in (
+                        "relation",
+                        "clearance_m",
+                        "offset_axis",
+                        "offset_direction",
+                        "offset_m",
+                    )
+                }
                 return ActionOutcome(
                     action="place_object",
                     success=True,
@@ -527,6 +711,7 @@ class IsaacRpcDriver:
                         "target_ref": self._held_target["object_id"],
                         "destination_ref": destination["object_id"],
                         "expected_place_position_m": list(place_position),
+                        "placement": dict(self._place_parameters),
                         "phase": last_state.get("phase"),
                     },
                 )
@@ -548,23 +733,60 @@ class IsaacRpcDriver:
             and requested_destination != self._active_destination.get("object_id")
         ):
             raise ValueError("Verification destination differs from the executed place action")
+        requested_parameters = {
+            key: arguments.get(key)
+            for key in (
+                "relation",
+                "clearance_m",
+                "offset_axis",
+                "offset_direction",
+                "offset_m",
+            )
+        }
+        if requested_parameters != self._place_parameters:
+            raise ValueError("Verification relation differs from the executed place action")
 
         observations = self._perceive_current_view()
         target_label = str(self._held_target.get("label") or "")
-        expected = self._expected_place_position
+        destination_id = (
+            None if self._active_destination is None else self._active_destination.get("object_id")
+        )
+        observed_destination = next(
+            (item for item in observations if item.get("object_id") == destination_id),
+            None,
+        )
+        if observed_destination is None:
+            return ActionOutcome(
+                action="verify_transfer",
+                success=False,
+                message="Destination is not visible to wrist RGB-D for relation verification",
+                data={
+                    "destination_ref": destination_id,
+                    "relation": (self._place_parameters or {}).get("relation"),
+                    "visible_objects": list(observations),
+                    "source": "robot_mounted_wrist_rgbd",
+                },
+            )
+        expected = self._resolve_place_position(
+            self._held_target,
+            observed_destination,
+            dict(self._place_parameters or {}),
+        )
         best: dict[str, Any] | None = None
         best_score = -1.0
         best_error = float("inf")
         for observation in observations:
+            if observation.get("object_id") == destination_id:
+                continue
             scores = observation.get("semantic_scores") or {}
             score = float(scores.get(target_label, 0.0))
             position = self._position(observation)
             if position is None:
                 continue
-            error = sum(
-                (current - goal) ** 2
-                for current, goal in zip(position, expected, strict=True)
-            ) ** 0.5
+            error = (
+                sum((current - goal) ** 2 for current, goal in zip(position, expected, strict=True))
+                ** 0.5
+            )
             ranking = score - min(error, 1.0)
             if ranking > best_score - min(best_error, 1.0):
                 best, best_score, best_error = observation, score, error
@@ -584,11 +806,8 @@ class IsaacRpcDriver:
             ),
             data={
                 "target_label": target_label,
-                "destination_ref": (
-                    None
-                    if self._active_destination is None
-                    else self._active_destination.get("object_id")
-                ),
+                "destination_ref": destination_id,
+                "relation": (self._place_parameters or {}).get("relation"),
                 "expected_place_position_m": list(expected),
                 "observed_target": best,
                 "semantic_score": best_score,
@@ -631,13 +850,15 @@ class IsaacRpcDriver:
         self._run_dir = run_dir
 
     def end_session(self) -> None:
-        if not self._recording:
-            return
         try:
-            self._call({"cmd": "end_record"})
+            if self._recording:
+                self._call({"cmd": "end_record"})
         finally:
             self._recording = False
             self._run_dir = None
+            close_perception = getattr(self._perception, "close", None)
+            if callable(close_perception):
+                close_perception()
 
 
 def create_driver() -> IsaacRpcDriver:

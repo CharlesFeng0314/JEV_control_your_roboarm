@@ -7,6 +7,7 @@ from typing import Any
 import cv2
 import numpy as np
 from scipy.spatial import cKDTree
+from sklearn.cluster import DBSCAN
 
 
 def quaternion_matrix(quaternion_wxyz: list[float]) -> np.ndarray:
@@ -45,6 +46,13 @@ def gripper_camera_local_matrix(
 
 def camera_axes(pose: dict[str, Any]) -> tuple[np.ndarray, ...]:
     eye = np.asarray(pose["eye_world_m"], dtype=np.float64)
+    orientation = pose.get("orientation_wxyz")
+    if isinstance(orientation, (list, tuple)) and len(orientation) == 4:
+        rotation = quaternion_matrix(orientation)
+        right = rotation[:, 0]
+        down = -rotation[:, 1]
+        forward = -rotation[:, 2]
+        return eye, right, down, forward
     target = np.asarray(pose["target_world_m"], dtype=np.float64)
     forward = target - eye
     forward /= np.linalg.norm(forward)
@@ -145,7 +153,8 @@ def remove_gripper(
     box_min: list[float],
     box_max: list[float],
 ) -> np.ndarray:
-    _camera, world = world_maps(depth_mm, intrinsics, pose)
+    oriented_pose = {**pose, "orientation_wxyz": camera_orientation_wxyz}
+    _camera, world = world_maps(depth_mm, intrinsics, oriented_pose)
     camera_world = np.eye(4, dtype=np.float64)
     camera_world[:3, :3] = quaternion_matrix(camera_orientation_wxyz)
     camera_world[:3, 3] = np.asarray(pose["eye_world_m"], dtype=np.float64)
@@ -159,6 +168,46 @@ def remove_gripper(
     kept = depth_mm.copy()
     kept[inside] = 0
     return kept
+
+
+def _find(parent: list[int], value: int) -> int:
+    while parent[value] != value:
+        parent[value] = parent[parent[value]]
+        value = parent[value]
+    return value
+
+
+def _merge_nearby_clusters(points: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    """Merge DBSCAN fragments using the rule from the winning benchmark method."""
+    cluster_ids = sorted(int(value) for value in np.unique(labels) if value >= 0)
+    if not cluster_ids:
+        return labels
+    bounds = {
+        cluster_id: (
+            points[labels == cluster_id].min(axis=0),
+            points[labels == cluster_id].max(axis=0),
+        )
+        for cluster_id in cluster_ids
+    }
+    parent = list(range(max(cluster_ids) + 1))
+    for index, left in enumerate(cluster_ids):
+        for right in cluster_ids[index + 1 :]:
+            minimum_left, maximum_left = bounds[left]
+            minimum_right, maximum_right = bounds[right]
+            gap = np.maximum(
+                0.0,
+                np.maximum(minimum_left - maximum_right, minimum_right - maximum_left),
+            )
+            if float(np.linalg.norm(gap)) < 0.032:
+                left_root, right_root = _find(parent, left), _find(parent, right)
+                if left_root != right_root:
+                    parent[right_root] = left_root
+    roots = {cluster_id: _find(parent, cluster_id) for cluster_id in cluster_ids}
+    root_order = {root: index for index, root in enumerate(sorted(set(roots.values())))}
+    merged = labels.copy()
+    for cluster_id, root in roots.items():
+        merged[labels == cluster_id] = root_order[root]
+    return merged
 
 
 def cluster_table_objects(
@@ -186,52 +235,23 @@ def cluster_table_objects(
     sample_points = world[ys[sample_use], xs[sample_use]]
     if len(sample_points) < min_samples:
         return []
-    voxel_size = eps_m * 0.72
-    voxel_keys = np.floor(sample_points / voxel_size).astype(np.int32)
-    unique_keys, inverse, counts = np.unique(
-        voxel_keys,
-        axis=0,
-        return_inverse=True,
-        return_counts=True,
-    )
-    key_to_index = {tuple(key): index for index, key in enumerate(unique_keys.tolist())}
-    visited = np.zeros(len(unique_keys), dtype=bool)
-    sample_labels = np.full(len(sample_points), -1, dtype=np.int32)
-    neighbor_offsets = [
-        (dx, dy, dz)
-        for dx in (-1, 0, 1)
-        for dy in (-1, 0, 1)
-        for dz in (-1, 0, 1)
-        if (dx, dy, dz) != (0, 0, 0)
-    ]
-    next_label = 0
-    for start in range(len(unique_keys)):
-        if visited[start]:
-            continue
-        stack = [start]
-        visited[start] = True
-        component = []
-        while stack:
-            current = stack.pop()
-            component.append(current)
-            key = unique_keys[current]
-            for offset in neighbor_offsets:
-                neighbor = key_to_index.get(tuple((key + offset).tolist()))
-                if neighbor is not None and not visited[neighbor]:
-                    visited[neighbor] = True
-                    stack.append(neighbor)
-        if int(np.sum(counts[component])) < max(12, min_samples):
-            continue
-        in_component = np.isin(inverse, component)
-        points = sample_points[in_component]
+    sample_labels = DBSCAN(
+        eps=eps_m,
+        min_samples=min_samples,
+        algorithm="kd_tree",
+        n_jobs=-1,
+    ).fit_predict(sample_points)
+    sample_labels = _merge_nearby_clusters(sample_points, sample_labels)
+    good_labels = []
+    for label in sorted(int(value) for value in np.unique(sample_labels) if value >= 0):
+        points = sample_points[sample_labels == label]
         extent = points.max(axis=0) - points.min(axis=0)
-        if extent[2] < 0.006 or float(np.max(extent)) > 0.55:
+        if len(points) < 12 or extent[2] < 0.006 or float(np.max(extent)) > 0.55:
             continue
-        sample_labels[in_component] = next_label
-        next_label += 1
-    if next_label == 0:
+        good_labels.append(label)
+    if not good_labels:
         return []
-    selected = sample_labels >= 0
+    selected = np.isin(sample_labels, good_labels)
     tree = cKDTree(sample_points[selected])
     kept_labels = sample_labels[selected]
     full_points = world[ys, xs]
@@ -240,7 +260,7 @@ def cluster_table_objects(
     close = distances <= max(0.045, eps_m * 1.35)
     full_labels[close] = kept_labels[nearest[close]]
     masks = []
-    for label in range(next_label):
+    for label in good_labels:
         use = full_labels == label
         if int(np.count_nonzero(use)) < 30:
             continue

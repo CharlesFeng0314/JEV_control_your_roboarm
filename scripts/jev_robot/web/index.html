@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JEV Robot Control</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="JEV Robot Control">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><strong>JEV</strong><small>ROBOT CONTROL</small></span>
+      </a>
+      <div class="connection">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="connection-label">System ready</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Embodied intelligence / operator console</p>
+          <h1>Tell the robot<br><span>what done looks like.</span></h1>
+          <p class="hero-copy">JEV reads the live wrist-camera state, chooses one grounded action, and leaves motion validation to the robot.</p>
+        </div>
+        <div class="system-card">
+          <div class="system-card-head"><span>CONTROL CONTRACT</span><b>LIVE</b></div>
+          <div class="contract-line"><span>01</span><p>Facts come from robot-mounted sensors</p></div>
+          <div class="contract-line"><span>02</span><p>JEV chooses the next bounded action</p></div>
+          <div class="contract-line"><span>03</span><p>Driver validates and executes motion</p></div>
+        </div>
+      </section>
+
+      <form class="composer" id="goal-form">
+        <label for="goal-input">Robot goal</label>
+        <div class="composer-row">
+          <textarea id="goal-input" rows="2" placeholder="e.g. Pick up the sugar box and place it on the red block" required></textarea>
+          <button type="submit" id="run-button">
+            <span>Start fresh run</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6"/></svg>
+          </button>
+        </div>
+        <div class="composer-meta">
+          <span>Each start creates a new run</span>
+          <span>Finger control: <b>grasp / release</b></span>
+          <span>End-effector micro-adjustment: <b>enabled</b></span>
+        </div>
+        <p class="form-error" id="form-error" role="alert"></p>
+      </form>
+
+      <section class="vision-console" aria-labelledby="wrist-title">
+        <div class="vision-main">
+          <div class="vision-head">
+            <div>
+              <span class="panel-index">LIVE SENSOR</span>
+              <h2 id="wrist-title">Wrist camera</h2>
+            </div>
+            <div class="camera-connection">
+              <span class="camera-dot" id="camera-dot"></span>
+              <span id="camera-label">Waiting for Isaac</span>
+            </div>
+          </div>
+          <div class="camera-viewport">
+            <img id="wrist-frame" alt="Live RGB view from the robot wrist camera">
+            <div class="camera-offline" id="camera-offline">
+              <span class="camera-reticle" aria-hidden="true"></span>
+              <strong>NO WRIST SIGNAL</strong>
+              <p>Start the Isaac scene host or connect the robot camera. The preview will attach automatically.</p>
+            </div>
+            <div class="camera-overlay camera-overlay-top">
+              <span>WRIST / RGB</span><span id="camera-live-badge">STANDBY</span>
+            </div>
+            <div class="camera-overlay camera-overlay-bottom">
+              <span id="camera-sequence">FRAME —</span><span id="camera-resolution">— × —</span>
+            </div>
+          </div>
+        </div>
+        <aside class="vision-aside">
+          <div>
+            <span class="section-label">Signal path</span>
+            <p>Robot-mounted RGB → Isaac RPC → local frame cache → operator console</p>
+          </div>
+          <div class="vision-metric">
+            <span>Source</span><strong id="camera-source">Disconnected</strong>
+          </div>
+          <div class="vision-metric">
+            <span>Refresh</span><strong>Automatic</strong>
+          </div>
+          <p class="vision-note" id="camera-message">The control interface is ready; the camera is waiting for the robot service.</p>
+        </aside>
+      </section>
+
+      <section class="workspace" id="workspace">
+        <article class="panel context-panel">
+          <div class="panel-head">
+            <div><span class="panel-index">01</span><h2>World context</h2></div>
+            <span class="panel-state" id="scene-state">Awaiting run</span>
+          </div>
+          <div id="context-empty" class="empty-state">
+            <span class="radar" aria-hidden="true"><i></i></span>
+            <p>Live wrist perception and persistent scene memory will appear here.</p>
+          </div>
+          <div id="context-content" class="context-content hidden"></div>
+        </article>
+
+        <article class="panel decision-panel">
+          <div class="panel-head">
+            <div><span class="panel-index">02</span><h2>JEV decisions</h2></div>
+            <span class="panel-state" id="decision-state">No question yet</span>
+          </div>
+          <div id="decision-empty" class="empty-state compact">
+            <p>Every turn will show the question and choices before JEV answers.</p>
+          </div>
+          <div id="decision-feed" class="decision-feed"></div>
+        </article>
+
+        <article class="panel telemetry-panel">
+          <div class="panel-head">
+            <div><span class="panel-index">03</span><h2>Robot telemetry</h2></div>
+            <span class="panel-state" id="robot-state">Idle</span>
+          </div>
+          <div id="telemetry-empty" class="empty-state compact">
+            <p>Validated actions and sensor feedback will stream here.</p>
+          </div>
+          <div id="telemetry-feed" class="telemetry-feed"></div>
+        </article>
+      </section>
+    </main>
+    <footer><span>LOCAL OPERATOR INTERFACE</span><span>JEV chooses · robot validates · sensors verify</span></footer>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

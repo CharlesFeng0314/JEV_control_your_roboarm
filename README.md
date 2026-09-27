@@ -93,10 +93,10 @@ This separation is intentional. JEV receives closed, dynamically generated choic
 | Search | Move only the wrist camera through configured safe views and look for a named object |
 | Observe | Re-observe with the wrist camera and localize an object |
 | Pick | Grasp an object that has already been seen and checked |
-| Place | Put the held object at a selected destination |
-| Verify | Re-observe and check whether the intended transfer happened |
+| Place | Put the held object in a selected relation such as on, inside, next to, or a bounded directional offset |
+| Verify | Re-observe both objects and check the selected spatial relation |
 | Nudge the hand | Translate or rotate the hand by one bounded step, such as 3 mm or 5 degrees |
-| Adjust the gripper | Hold, open, close, or change opening by one bounded step |
+| Adjust the gripper | Grasp by closing once toward contact, or release by opening fully; no finger micro-steps |
 | Move a tool | Hold or follow a straight segment, arc, or circle, such as stirring |
 | Finish | Request termination after later observation has checked the goal |
 | Ask you | Stop and return control when the goal or scene remains ambiguous |
@@ -121,11 +121,13 @@ Implemented:
 - [x] Wrist RGB-D perception path
 - [x] Scene snapshot and persistent scene memory
 - [x] Dynamic JEV choices derived from scene state and driver capabilities
-- [x] Bounded motion/gripper/tool parameters
+- [x] Bounded end-effector/tool parameters and binary grasp/release control
 - [x] Deterministic rejection of unsupported or insufficiently grounded actions
 - [x] Re-observation after actions
 - [x] Finish gating and turn budget
 - [x] Isaac Sim RPC driver path
+- [x] Dynamic pick/place RPC with JEV-selected spatial relation and wrist verification
+- [x] Product-style local Web UI with question → choices → JEV’s choice, while full JSON remains in the run archive
 - [x] Per-run logging of prompts, JEV answers, actions, and observations
 
 Next:
@@ -147,19 +149,33 @@ copy .env.example .env
 
 Put your own `AI_GATEWAY_API_KEY` in `.env`.
 
-The current runnable path expects the Isaac RPC driver to be available. Open the app and type a goal:
+The product runs as two persistent processes. Open two PowerShell windows and start both from the repository root.
+
+**Terminal A — start Isaac Sim and the robot RPC service:**
 
 ```powershell
-python -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_household
+cd H:\robo
+H:\robo\.conda-isaacsim\python.exe -u scripts\manipulation\simulation\isaac_scene_host.py --config scripts\manipulation\config\tabletop_household_franka_wrist_rgbd_v1.json --output data\manipulation\scene_hosts\tabletop_franka_live --port 47631
 ```
 
-Or pass the instruction directly:
+That single command opens the Isaac Sim GUI and serves the scene, physics, arm state, and wrist RGB-D interface on `127.0.0.1:47631`. Keep the terminal and Isaac window open.
+
+**Terminal B — start the JEV Web console:**
 
 ```powershell
-python -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_household --goal "put the sugar box on the red block"
+cd H:\robo
+H:\robo\.conda\python.exe -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_franka_live
 ```
 
-The driver connects to `127.0.0.1:47631` unless `JEV_ISAAC_RPC_HOST` and `JEV_ISAAC_RPC_PORT` specify otherwise.
+The browser opens locally. When **Wrist camera** changes from `NO WRIST SIGNAL` to `LIVE`, the Sim/RPC link is ready. Enter a goal and choose **Start fresh run**; every click begins at turn 1.
+
+To run headlessly instead:
+
+```powershell
+H:\robo\.conda\python.exe -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_franka_live --goal "put the sugar box on the red block"
+```
+
+The driver uses `127.0.0.1:47631` by default. Set `JEV_ISAAC_RPC_HOST` and `JEV_ISAAC_RPC_PORT` for a physical or remote robot service. Stop Terminal B with `Ctrl+C` before closing Terminal A / Isaac Sim.
 
 Each run stores the prompt, JEV answers, selected action, and wrist observation under:
 

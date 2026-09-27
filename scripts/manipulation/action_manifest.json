@@ -33,11 +33,10 @@
     },
     {
       "name": "adjust_gripper",
-      "description": "Adjust gripper aperture by a bounded per-finger increment with a stop condition.",
+      "description": "Grasp by closing once toward contact, or release by opening fully; no incremental finger steps.",
       "implementation": "actions/adjust_gripper.py",
       "inputs": {
-        "command": "hold|open|close|widen|narrow",
-        "step_m": "0|0.0005|0.001|0.002|0.005",
+        "command": "grasp|release",
         "stop_condition": "position_reached|contact|force_limit|visual_goal|user_stop"
       },
       "outputs": {"result": "ActionResult"},
@@ -73,23 +72,38 @@
       "name": "pick_object",
       "description": "Pick a previously observed and validated target.",
       "implementation": "actions/pick_object.py",
-      "inputs": {"observation": "ObjectObservation"},
+      "inputs": {"target_ref": "fresh perceived object id"},
       "outputs": {"result": "ActionResult"},
       "preconditions": ["fresh observation", "reachable pose", "gripper empty"]
     },
     {
       "name": "place_object",
-      "description": "Place the held object at a validated destination.",
+      "description": "Place the held object in a JEV-selected spatial relation to a perceived destination.",
       "implementation": "actions/place_object.py",
-      "inputs": {"destination": "Pose3D"},
+      "inputs": {
+        "destination_ref": "perceived object id",
+        "relation": "on|inside|next_to|left_of|right_of|in_front_of|behind|at_destination",
+        "clearance_m": "0|0.005|0.020",
+        "offset_axis": "none|x|y|z",
+        "offset_direction": "none|positive|negative",
+        "offset_m": "0|0.001|0.003|0.005|0.010|0.025"
+      },
       "outputs": {"result": "ActionResult"},
       "preconditions": ["object held", "destination reachable"]
     },
     {
       "name": "verify_transfer",
-      "description": "Use robot-mounted perception to verify that the requested transfer is satisfied.",
+      "description": "Use robot-mounted perception to verify the selected target/destination spatial relation.",
       "implementation": "actions/verify_transfer.py",
-      "inputs": {"observation": "ObjectObservation", "destination": "Pose3D"},
+      "inputs": {
+        "target_ref": "perceived object id",
+        "destination_ref": "perceived object id",
+        "relation": "on|inside|next_to|left_of|right_of|in_front_of|behind|at_destination",
+        "clearance_m": "0|0.005|0.020",
+        "offset_axis": "none|x|y|z",
+        "offset_direction": "none|positive|negative",
+        "offset_m": "0|0.001|0.003|0.005|0.010|0.025"
+      },
       "outputs": {"result": "ActionResult"},
       "side_effect": "none"
     }

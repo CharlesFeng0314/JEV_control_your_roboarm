@@ -57,7 +57,6 @@ class FineMotionCommand:
 @dataclass(frozen=True)
 class GripperAdjustment:
     command: str
-    step_m: float
     stop_condition: str
 
 

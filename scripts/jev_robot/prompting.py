@@ -8,6 +8,77 @@ from typing import Any
 from .contracts import ActionOutcome, SceneSnapshot
 from .manifest import ActionCatalog
 
+_PROMPT_OBJECT_KEYS = (
+    "object_id",
+    "id",
+    "label",
+    "description",
+    "attributes",
+    "confidence",
+    "pose",
+    "position",
+    "bbox3d_world_m",
+)
+_PROMPT_ACTION_DATA_KEYS = (
+    "target_label",
+    "search_scope",
+    "visited_views",
+    "minimum_target_score",
+    "best_target_score",
+    "target_ref",
+    "destination_ref",
+    "relation",
+    "phase",
+    "failure_reason",
+    "object_id",
+)
+
+
+def summarize_scene_object(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep identity and pose. Drop score maps, masks, and grasp geometry."""
+    summary: dict[str, Any] = {}
+    for key in _PROMPT_OBJECT_KEYS:
+        if key not in item:
+            continue
+        value = item[key]
+        if key in {"attributes", "pose", "position", "bbox3d_world_m"}:
+            if isinstance(value, (dict, list)):
+                summary[key] = value
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            summary[key] = value
+    return summary
+
+
+def summarize_action_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Record what the robot did without replaying that turn's scene payload."""
+    raw_data = record.get("data")
+    data = raw_data if isinstance(raw_data, Mapping) else {}
+    summary: dict[str, Any] = {
+        "action": record.get("action"),
+        "success": bool(record.get("success")),
+        "message": str(record.get("message") or ""),
+    }
+    if record.get("time"):
+        summary["time"] = record["time"]
+    kept: dict[str, Any] = {}
+    for key in _PROMPT_ACTION_DATA_KEYS:
+        value = data.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            kept[key] = value
+    arguments = data.get("arguments")
+    if isinstance(arguments, Mapping):
+        flat = {
+            str(key): value
+            for key, value in arguments.items()
+            if isinstance(value, (str, int, float, bool))
+        }
+        if flat:
+            kept["arguments"] = flat
+    if kept:
+        summary["data"] = kept
+    return summary
+
 
 def build_given_that(
     user_goal: str,
@@ -38,10 +109,32 @@ def build_given_that(
             }
             for action in catalog.actions
         ],
-        "current_scene": snapshot.to_dict(),
-        "scene_memory": dict(scene_memory or {}),
-        "recent_action_results": [outcome.to_dict() for outcome in history[-8:]],
+        "current_scene": _prompt_scene(snapshot),
+        "scene_memory": _prompt_memory(scene_memory),
+        "recent_action_results": [
+            summarize_action_record(outcome.to_dict()) for outcome in history[-8:]
+        ],
     }
+
+
+def _prompt_scene(snapshot: SceneSnapshot) -> dict[str, Any]:
+    scene = snapshot.to_dict()
+    scene["visible_objects"] = [
+        summarize_scene_object(item) for item in scene.get("visible_objects") or []
+    ]
+    return scene
+
+
+def _prompt_memory(scene_memory: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Replay fused object belief.
+
+    Action history for the current robot goal is supplied separately as
+    ``recent_action_results``. The scene file also keeps earlier goals' actions,
+    and those logs are not copied into a new goal's prompt.
+    """
+    memory = dict(scene_memory or {})
+    memory.pop("recent_actions", None)
+    return memory
 
 
 def render_given_that(state: Mapping[str, Any]) -> str:

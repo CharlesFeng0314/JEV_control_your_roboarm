@@ -1,9 +1,9 @@
-"""Execute one complete grasp or release command."""
+"""Open the fingers fully, or close them once toward contact."""
 
 from backend import ManipulationBackend
 from contracts import ActionResult, GripperAdjustment
 
-_ALLOWED_COMMANDS = {"grasp", "release"}
+_ALLOWED_COMMANDS = {"open", "close"}
 _ALLOWED_STOPS = {"position_reached", "contact", "force_limit", "visual_goal", "user_stop"}
 
 

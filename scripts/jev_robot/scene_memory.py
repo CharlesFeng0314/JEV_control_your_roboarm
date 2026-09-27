@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import ActionOutcome, SceneSnapshot, utc_now
+from .prompting import summarize_action_record, summarize_scene_object
 
 FORBIDDEN_SOURCES = {"spectator_camera", "simulator_ground_truth", "usd_stage"}
 _SAFE_ID = re.compile(r"[^a-zA-Z0-9_.-]+")
@@ -56,7 +57,10 @@ class SceneMemory:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if payload.get("scene_id") != scene_id:
                 raise ValueError("Scene memory id does not match the requested scene")
-            return cls(path, scene_id, payload)
+            memory = cls(path, scene_id, payload)
+            if memory._compact_stored_actions():
+                memory.save()
+            return memory
         root.mkdir(parents=True, exist_ok=True)
         memory = cls(path, scene_id)
         memory.save()
@@ -107,7 +111,7 @@ class SceneMemory:
                 "label_evidence": label_evidence,
                 "latest_pose": observed_pose,
                 "pose_history": pose_history,
-                "latest_observation": candidate,
+                "latest_observation": summarize_scene_object(candidate),
                 "first_seen_at": previous.get("first_seen_at") or now,
                 "last_seen_at": now,
                 "last_seen_revision": next_revision,
@@ -133,12 +137,43 @@ class SceneMemory:
         self.save()
         return self.prompt_view()
 
-    def record_outcome(self, outcome: ActionOutcome) -> None:
+    def begin_goal(self, user_goal: str) -> None:
+        """Start a robot goal. Earlier goals stay archived and leave the next prompt."""
+        goal = user_goal.strip()
+        if not goal:
+            raise ValueError("User goal must not be empty")
+        if self.payload.get("active_goal") == goal:
+            return
+        self.payload["active_goal"] = goal
+        self.payload["goal_started_at"] = utc_now()
+        self.payload["revision"] = int(self.payload["revision"]) + 1
+        self.save()
+
+    def record_outcome(self, outcome: ActionOutcome, *, goal: str | None = None) -> None:
+        self._compact_stored_actions()
+        record = summarize_action_record({"time": utc_now(), **outcome.to_dict()})
+        active_goal = (goal or self.payload.get("active_goal") or "").strip()
+        if active_goal:
+            record["goal"] = active_goal
         actions = self.payload["recent_actions"]
-        actions.append({"time": utc_now(), **outcome.to_dict()})
+        actions.append(record)
         del actions[:-50]
         self.payload["revision"] = int(self.payload["revision"]) + 1
         self.save()
+
+    def _compact_stored_actions(self) -> bool:
+        actions = list(self.payload.get("recent_actions") or [])
+        compact = []
+        for item in actions[-50:]:
+            record = summarize_action_record(item)
+            goal = str(item.get("goal") or "").strip()
+            if goal:
+                record["goal"] = goal
+            compact.append(record)
+        if compact == actions:
+            return False
+        self.payload["recent_actions"] = compact
+        return True
 
     def prompt_view(self) -> dict[str, Any]:
         known = []
@@ -173,5 +208,4 @@ class SceneMemory:
             "known_objects": known,
             "latest_robot_facts": self.payload["latest_robot_facts"],
             "unknown_regions": self.payload["unknown_regions"],
-            "recent_actions": self.payload["recent_actions"][-8:],
         }

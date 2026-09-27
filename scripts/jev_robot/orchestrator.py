@@ -76,6 +76,8 @@ class ProductOrchestrator:
                 "continued_outcomes": len(initial_outcomes),
             },
         )
+        if self.memory is not None:
+            self.memory.begin_goal(user_goal)
         first_turn = len(decisions) + 1
         for turn in range(first_turn, first_turn + self.max_turns):
             snapshot = self.bridge.driver.snapshot()
@@ -147,7 +149,7 @@ class ProductOrchestrator:
                 )
                 outcomes.append(rejected)
                 if self.memory is not None:
-                    self.memory.record_outcome(rejected)
+                    self.memory.record_outcome(rejected, goal=user_goal)
                 self.sink.emit("finish_rejected", rejected.to_dict())
                 continue
             self.sink.emit(
@@ -161,7 +163,7 @@ class ProductOrchestrator:
             outcome = self.bridge.execute(decision)
             outcomes.append(outcome)
             if self.memory is not None:
-                self.memory.record_outcome(outcome)
+                self.memory.record_outcome(outcome, goal=user_goal)
             self.sink.emit("action_finished", {"turn": turn, **outcome.to_dict()})
         return self._result(
             "max_turns",

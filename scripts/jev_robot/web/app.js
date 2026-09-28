@@ -14,18 +14,9 @@ const dom = {
   telemetryEmpty: document.querySelector("#telemetry-empty"),
   telemetryFeed: document.querySelector("#telemetry-feed"),
   robotState: document.querySelector("#robot-state"),
-  cameraDot: document.querySelector("#camera-dot"),
-  cameraLabel: document.querySelector("#camera-label"),
-  cameraFrame: document.querySelector("#wrist-frame"),
-  cameraOffline: document.querySelector("#camera-offline"),
-  cameraSequence: document.querySelector("#camera-sequence"),
-  cameraResolution: document.querySelector("#camera-resolution"),
-  cameraSource: document.querySelector("#camera-source"),
-  cameraMessage: document.querySelector("#camera-message"),
-  cameraLiveBadge: document.querySelector("#camera-live-badge"),
 };
 
-const app = { cursor: 0, turns: new Map(), requestInFlight: false, cameraSequence: -1 };
+const app = { cursor: 0, turns: new Map(), requestInFlight: false };
 
 function node(tag, className, text) {
   const element = document.createElement(tag);
@@ -206,6 +197,23 @@ function renderChoice(payload) {
     node("span", "answer-confidence", percent(payload.confidence)),
   );
   answer.append(row);
+  const minorQuestions = payload.minor_questions || [];
+  if (minorQuestions.length) {
+    const minor = node("div", "minor-questions");
+    minor.append(node("div", "choice-label", "Action parameters"));
+    minorQuestions.forEach((question) => {
+      const item = node("div", "minor-question");
+      const copy = node("div", "minor-copy");
+      copy.append(node("span", "minor-name", pretty(question.name)));
+      if (question.prompt) copy.append(node("span", "minor-prompt", question.prompt));
+      item.append(
+        copy,
+        node("span", "minor-choice", pretty(question.selected)),
+      );
+      minor.append(item);
+    });
+    answer.append(minor);
+  }
   const args = payload.arguments || {};
   const entries = Object.entries(args).filter(([, value]) => value !== null && value !== "none" && value !== 0);
   if (entries.length) {
@@ -311,58 +319,5 @@ dom.form.addEventListener("submit", async (event) => {
   }
 });
 
-async function pollCamera() {
-  try {
-    const response = await fetch("/api/camera/status", { cache: "no-store" });
-    if (!response.ok) throw new Error(`Camera status returned ${response.status}`);
-    const status = await response.json();
-    dom.cameraMessage.textContent = status.message || "Waiting for wrist camera.";
-    if (!status.available) {
-      dom.cameraDot.className = "camera-dot";
-      dom.cameraLabel.textContent = "Preview unavailable";
-      dom.cameraSource.textContent = "Not exposed";
-      return;
-    }
-    if (!status.connected || !status.frame_available) {
-      dom.cameraDot.className = "camera-dot waiting";
-      dom.cameraLabel.textContent = "Waiting for robot";
-      dom.cameraSource.textContent = "Disconnected";
-      dom.cameraFrame.classList.remove("live");
-      dom.cameraOffline.classList.remove("hidden");
-      dom.cameraLiveBadge.classList.remove("live");
-      dom.cameraLiveBadge.textContent = "STANDBY";
-      return;
-    }
-    dom.cameraDot.className = "camera-dot live";
-    dom.cameraLabel.textContent = "Wrist RGB live";
-    dom.cameraSource.textContent = pretty(status.source || "robot wrist rgb");
-    dom.cameraLiveBadge.classList.add("live");
-    dom.cameraLiveBadge.textContent = "LIVE";
-    const shape = status.shape || [];
-    dom.cameraResolution.textContent = shape.length === 2 ? `${shape[1]} × ${shape[0]}` : "LIVE";
-    dom.cameraSequence.textContent = `FRAME ${String(status.sequence).padStart(6, "0")}`;
-    if (status.sequence !== app.cameraSequence) {
-      app.cameraSequence = status.sequence;
-      dom.cameraFrame.src = `/api/camera/frame?sequence=${status.sequence}`;
-    }
-  } catch (error) {
-    dom.cameraDot.className = "camera-dot";
-    dom.cameraLabel.textContent = "Camera API offline";
-    dom.cameraMessage.textContent = error.message;
-  }
-}
-
-dom.cameraFrame.addEventListener("load", () => {
-  dom.cameraFrame.classList.add("live");
-  dom.cameraOffline.classList.add("hidden");
-});
-
-dom.cameraFrame.addEventListener("error", () => {
-  dom.cameraFrame.classList.remove("live");
-  dom.cameraOffline.classList.remove("hidden");
-});
-
 poll();
-pollCamera();
 setInterval(poll, 450);
-setInterval(pollCamera, 700);

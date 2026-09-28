@@ -12,6 +12,7 @@ from typesafe_sdk import Choice, Noul, TypeSafeClient
 
 from .contracts import JevDecision
 from .manifest import ActionCatalog
+from .prompting import build_parameter_state
 
 DEFAULT_MODEL = "jev-latest"
 DEFAULT_BASE_URL = "https://api.typesafe.ai"
@@ -55,22 +56,38 @@ AXIAL_STEPS = {"none": 0.0, "micro": 0.001, "fine": 0.003, "small": 0.005, "medi
 PLACEMENT_CLEARANCES = {"contact": 0.0, "close": 0.005, "safe": 0.020}
 
 
-def _candidate_criteria(state: Mapping[str, Any], *, destination: bool) -> dict[str, str]:
+def _candidate_criteria(
+    state: Mapping[str, Any],
+    *,
+    destination: bool,
+    current_only: bool = False,
+) -> dict[str, str]:
     scene = state.get("current_scene") or {}
     visible = scene.get("visible_objects") or []
     memory = state.get("scene_memory") or {}
     remembered = memory.get("known_objects") or []
+    remembered_by_id = {
+        str(item.get("object_id")): item for item in remembered if item.get("object_id")
+    }
+    bindings = memory.get("active_bindings") or {}
+    binding = bindings.get("destination" if destination else "target") or {}
+    committed_id = str(binding.get("object_id") or "")
     role = "destination" if destination else "target"
     criteria: dict[str, str] = {}
     for index, item in enumerate(visible):
         candidate_id = str(item.get("object_id") or item.get("id") or f"candidate_{index}")
-        label = str(item.get("description") or item.get("label") or candidate_id)
+        stable = remembered_by_id.get(candidate_id) or {}
+        stable_label = str(stable.get("label") or item.get("label") or candidate_id)
+        observed_label = str(item.get("description") or item.get("label") or candidate_id)
         attributes = item.get("attributes") or {}
         pose = item.get("pose") or item.get("position") or "pose unavailable"
+        commitment = " This is the active goal binding." if candidate_id == committed_id else ""
         criteria[candidate_id] = (
-            f"Visible {role} candidate {label}; attributes={attributes}; observed pose={pose}."
+            f"Visible {role} candidate with stable identity {stable_label!r}; current visual "
+            f"description={observed_label!r}; attributes={attributes}; observed pose={pose}."
+            + commitment
         )
-    for index, item in enumerate(remembered):
+    for index, item in enumerate(() if current_only else remembered):
         candidate_id = str(item.get("object_id") or f"remembered_{index}")
         if candidate_id in criteria:
             continue
@@ -119,7 +136,7 @@ def _search_scope_criteria(state: Mapping[str, Any]) -> dict[str, str]:
     ]
     history = ", ".join(failed_scopes) if failed_scopes else "none"
     history_note = f" Recent failed scopes: {history}."
-    return {
+    criteria = {
         "current_view": (
             "Do not move; inspect only the current robot-mounted camera view. Choose this only "
             "when this view has not already failed for the requested target." + history_note
@@ -134,6 +151,20 @@ def _search_scope_criteria(state: Mapping[str, Any]) -> dict[str, str]:
             "unobserved." + history_note
         ),
     }
+    recovery = state.get("recovery_context") or {}
+    if recovery.get("active"):
+        criteria["current_view"] += (
+            " A failed pick is under recovery, so this unchanged view cannot establish progress."
+        )
+        criteria["narrow"] += (
+            " Do not choose this after a pick failure when a bounded wide recovery search has "
+            "not been completed."
+        )
+        criteria["wide"] += (
+            " Choose this once to seek a new view of the locked recovery target with "
+            "grasp-feasible geometry."
+        )
+    return criteria
 
 
 def build_questions(
@@ -149,6 +180,65 @@ def build_questions(
         )
     action_criteria.update(CONTROL_CHOICES)
     recent = state.get("recent_action_results") or []
+    perception_progress = state.get("perception_progress") or {}
+    repeated_without_progress = int(
+        perception_progress.get("repeated_without_progress", 0)
+    )
+    if repeated_without_progress >= 2:
+        evidence = (
+            f" Robot feedback has repeated the same target geometry "
+            f"{repeated_without_progress} times without material progress."
+        )
+        for action in ("search_object", "observe_object"):
+            if action in action_criteria:
+                action_criteria[action] += (
+                    evidence
+                    + " Do not repeat this perception action unless it can change the viewpoint "
+                    "or resolve grasp feasibility."
+                )
+        action_criteria["request_user"] += (
+            evidence
+            + " Request operator review if no listed physical action can use the current facts."
+        )
+    recovery = state.get("recovery_context") or {}
+    if recovery.get("active"):
+        target_ref = recovery.get("target_ref") or "the locked target"
+        geometry_ready = bool(recovery.get("geometry_ready"))
+        if "observe_object" in action_criteria:
+            action_criteria["observe_object"] += (
+                " Do not repeat passive observation to recover a motion failure; it does not "
+                "change the approach geometry."
+            )
+        if "adjust_gripper" in action_criteria:
+            action_criteria["adjust_gripper"] += (
+                " Do not close the gripper in free space while pick recovery is active."
+            )
+        if geometry_ready:
+            if "pick_object" in action_criteria:
+                action_criteria["pick_object"] += (
+                    f" Recovery found grasp-feasible geometry for {target_ref}; retry this locked "
+                    "target now instead of searching or observing again."
+                )
+            if "search_object" in action_criteria:
+                action_criteria["search_object"] += (
+                    " Do not search again because recovery geometry is already grasp-feasible."
+                )
+        else:
+            if "search_object" in action_criteria:
+                action_criteria["search_object"] += (
+                    f" A pick failed for locked target {target_ref}. Perform at most one wide "
+                    "recovery search for grasp-feasible geometry; semantic recognition alone is "
+                    "not progress."
+                )
+            if "pick_object" in action_criteria:
+                action_criteria["pick_object"] += (
+                    " Retry only after recovery reports grasp-feasible geometry in the current "
+                    "view."
+                )
+        action_criteria["request_user"] += (
+            " Choose operator review if the bounded recovery search is exhausted without "
+            "grasp-feasible geometry."
+        )
     failed_wide_searches = sum(
         1
         for item in recent
@@ -476,6 +566,24 @@ def build_argument_questions(
     action: str, state: Mapping[str, Any], catalog: ActionCatalog
 ) -> dict[str, Noul | Choice]:
     all_questions = build_questions(state, catalog)
+    if "target_candidate" in ACTION_QUESTION_KEYS.get(action, ()):
+        all_questions["target_candidate"] = Choice(
+            instructions="Ground the user's requested target in stable object identity.",
+            criteria=_candidate_criteria(
+                state,
+                destination=False,
+                current_only=action == "pick_object",
+            ),
+        )
+    if "destination_candidate" in ACTION_QUESTION_KEYS.get(action, ()):
+        all_questions["destination_candidate"] = Choice(
+            instructions="Ground the requested destination in stable object identity.",
+            criteria=_candidate_criteria(
+                state,
+                destination=True,
+                current_only=action in {"place_object", "verify_transfer"},
+            ),
+        )
     return {key: all_questions[key] for key in ACTION_QUESTION_KEYS.get(action, ())}
 
 
@@ -555,6 +663,36 @@ def _dump_answer(answer: Any) -> dict[str, Any]:
     return dict(vars(answer))
 
 
+def _minor_question_payload(
+    questions: Mapping[str, Noul | Choice], answers: Mapping[str, Any]
+) -> tuple[dict[str, Any], ...]:
+    payload = []
+    for name, question in questions.items():
+        answer = answers.get(name)
+        if answer is None:
+            continue
+        dumped = _dump_answer(answer)
+        criteria = getattr(question, "criteria", None) or {}
+        probabilities = dumped.get("probabilities") or {}
+        payload.append(
+            {
+                "name": name,
+                "prompt": str(getattr(question, "instructions", "") or name),
+                "selected": dumped.get("choice", dumped.get("noul")),
+                "confidence": dumped.get("confidence"),
+                "choices": [
+                    {
+                        "name": str(choice),
+                        "description": str(description or ""),
+                        "probability": probabilities.get(choice),
+                    }
+                    for choice, description in criteria.items()
+                ],
+            }
+        )
+    return tuple(payload)
+
+
 def guard_action(
     action: str,
     confidence: float,
@@ -608,13 +746,7 @@ class JevDecisionEngine:
             argument_questions = build_argument_questions(action, state, catalog)
             argument_answers: Mapping[str, Any] = {}
             if argument_questions:
-                parameter_state = dict(state)
-                parameter_state["selected_next_action"] = action
-                parameter_state["parameter_selection_contract"] = (
-                    "Select only the bounded arguments for selected_next_action. Use recent "
-                    "robot feedback to make perceptual or motion progress; do not repeat a "
-                    "failed parameter choice without new evidence."
-                )
+                parameter_state = build_parameter_state(state, action)
                 argument_response = client.system_one(
                     state=parameter_state,
                     questions=argument_questions,
@@ -643,6 +775,7 @@ class JevDecisionEngine:
             },
             arguments=arguments,
             answers=dumped_answers,
+            minor_questions=_minor_question_payload(argument_questions, argument_answers),
             latency_ms=latency_ms,
         )
 

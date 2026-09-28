@@ -44,6 +44,7 @@ class JevDecision:
     probabilities: dict[str, float]
     arguments: dict[str, Any] = field(default_factory=dict)
     answers: dict[str, Any] = field(default_factory=dict)
+    minor_questions: tuple[dict[str, Any], ...] = ()
     latency_ms: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:

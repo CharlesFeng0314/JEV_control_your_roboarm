@@ -31,18 +31,6 @@ DEFAULT_SCENES = PROJECT_ROOT / "data" / "jev_robot" / "scenes"
 DriverFactory = Callable[[], RobotDriver]
 
 
-def load_wrist_frame_source(reference: str) -> Callable[[], dict] | None:
-    """Load an optional lightweight camera source from the selected driver module."""
-
-    module_name, _attribute = reference.split(":", 1)
-    source_factory = getattr(
-        importlib.import_module(module_name),
-        "create_wrist_frame_source",
-        None,
-    )
-    return source_factory() if callable(source_factory) else None
-
-
 def load_driver_factory(reference: str) -> DriverFactory:
     try:
         module_name, attribute = reference.split(":", 1)
@@ -148,7 +136,6 @@ def main() -> int:
     args = parse_args()
     api = load_api_settings(args.env)
     factory = load_driver_factory(args.driver_factory)
-    wrist_frame_source = load_wrist_frame_source(args.driver_factory)
     resume_context = load_resume_context(args.resume_run) if args.resume_run else None
     goal = args.goal or (resume_context.user_goal if resume_context else None)
     scene_id = args.scene_id or (
@@ -209,7 +196,6 @@ def main() -> int:
         host=args.web_host,
         port=args.web_port,
         open_browser=not args.no_browser,
-        wrist_frame_source=wrist_frame_source,
     )
     return 0
 

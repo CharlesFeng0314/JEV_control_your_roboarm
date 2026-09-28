@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 import webbrowser
 from collections.abc import Callable
 from http import HTTPStatus
@@ -18,7 +17,6 @@ from .events import CallbackEventSink, EventSink
 from .ui import humanize_service_error
 
 SessionRunner = Callable[[str, EventSink], SessionResult]
-WristFrameSource = Callable[[], dict[str, Any]]
 WEB_ROOT = Path(__file__).with_name("web")
 
 
@@ -69,97 +67,6 @@ class WebUiState:
         return True
 
 
-class WristCameraMonitor:
-    """Continuously cache the newest wrist RGB frame without blocking HTTP requests."""
-
-    def __init__(
-        self,
-        source: WristFrameSource | None,
-        *,
-        interval_s: float = 0.35,
-    ) -> None:
-        self._source = source
-        self._interval_s = interval_s
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._frame: bytes | None = None
-        self._sequence = 0
-        self._status: dict[str, Any] = {
-            "available": source is not None,
-            "connected": False,
-            "frame_available": False,
-            "sequence": 0,
-            "message": (
-                "Waiting for the robot wrist camera."
-                if source is not None
-                else "This robot driver does not expose a wrist camera preview."
-            ),
-        }
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        if self._source is None or self._thread is not None:
-            return
-        self._thread = threading.Thread(
-            target=self._run,
-            name="jev-wrist-camera",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-
-    def status(self) -> dict[str, Any]:
-        with self._lock:
-            return dict(self._status)
-
-    def frame(self) -> tuple[bytes | None, int]:
-        with self._lock:
-            return self._frame, self._sequence
-
-    def _run(self) -> None:
-        assert self._source is not None
-        while not self._stop.is_set():
-            started = time.perf_counter()
-            try:
-                packet = self._source()
-                raw_frame = packet.get("rgb_bytes")
-                if isinstance(raw_frame, (bytes, bytearray)) and raw_frame:
-                    frame = bytes(raw_frame)
-                else:
-                    path = Path(str(packet.get("rgb_path") or ""))
-                    if not path.is_file():
-                        raise FileNotFoundError("The wrist RGB frame is not available yet.")
-                    frame = path.read_bytes()
-                    if not frame:
-                        raise RuntimeError("The wrist RGB frame is empty.")
-                with self._lock:
-                    self._sequence += 1
-                    self._frame = frame
-                    self._status = {
-                        "available": True,
-                        "connected": True,
-                        "frame_available": True,
-                        "sequence": self._sequence,
-                        "shape": packet.get("shape"),
-                        "source": "robot_wrist_rgb",
-                        "message": "Live wrist camera connected.",
-                    }
-            except Exception as exc:
-                with self._lock:
-                    self._status = {
-                        **self._status,
-                        "available": True,
-                        "connected": False,
-                        "message": str(exc)[:240],
-                    }
-            elapsed = time.perf_counter() - started
-            self._stop.wait(max(0.05, self._interval_s - elapsed))
-
-
 class ProductWebServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -168,7 +75,6 @@ class ProductWebServer(ThreadingHTTPServer):
 def _handler(
     state: WebUiState,
     run_session: SessionRunner,
-    camera: WristCameraMonitor,
 ) -> type[BaseHTTPRequestHandler]:
     assets = {
         "/": ("index.html", "text/html; charset=utf-8"),
@@ -189,15 +95,6 @@ def _handler(
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def _send_frame(self, body: bytes, sequence: int) -> None:
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store, max-age=0")
-            self.send_header("X-Wrist-Frame-Sequence", str(sequence))
             self.end_headers()
             self.wfile.write(body)
 
@@ -224,19 +121,6 @@ def _handler(
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "since must be an integer"})
                     return
                 self._send_json(HTTPStatus.OK, state.snapshot(since))
-                return
-            if parsed.path == "/api/camera/status":
-                self._send_json(HTTPStatus.OK, camera.status())
-                return
-            if parsed.path == "/api/camera/frame":
-                frame, sequence = camera.frame()
-                if frame is None:
-                    self._send_json(
-                        HTTPStatus.SERVICE_UNAVAILABLE,
-                        {"error": "No wrist frame is available yet."},
-                    )
-                else:
-                    self._send_frame(frame, sequence)
                 return
             asset = assets.get(parsed.path)
             if asset is None:
@@ -280,14 +164,11 @@ def run_web_ui(
     host: str = "127.0.0.1",
     port: int = 8765,
     open_browser: bool = True,
-    wrist_frame_source: WristFrameSource | None = None,
 ) -> None:
     """Serve the operator UI locally until interrupted."""
 
     state = WebUiState()
-    camera = WristCameraMonitor(wrist_frame_source)
-    camera.start()
-    server = ProductWebServer((host, port), _handler(state, run_session, camera))
+    server = ProductWebServer((host, port), _handler(state, run_session))
     address, selected_port = server.server_address[:2]
     url = f"http://{address}:{selected_port}/"
     print(f"JEV Robot Control is ready at {url}", flush=True)
@@ -298,5 +179,4 @@ def run_web_ui(
     except KeyboardInterrupt:
         pass
     finally:
-        camera.stop()
         server.server_close()

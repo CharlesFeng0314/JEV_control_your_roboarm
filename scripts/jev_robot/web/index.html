@@ -53,48 +53,6 @@
         <p class="form-error" id="form-error" role="alert"></p>
       </form>
 
-      <section class="vision-console" aria-labelledby="wrist-title">
-        <div class="vision-main">
-          <div class="vision-head">
-            <div>
-              <span class="panel-index">LIVE SENSOR</span>
-              <h2 id="wrist-title">Wrist camera</h2>
-            </div>
-            <div class="camera-connection">
-              <span class="camera-dot" id="camera-dot"></span>
-              <span id="camera-label">Waiting for Isaac</span>
-            </div>
-          </div>
-          <div class="camera-viewport">
-            <img id="wrist-frame" alt="Live RGB view from the robot wrist camera">
-            <div class="camera-offline" id="camera-offline">
-              <span class="camera-reticle" aria-hidden="true"></span>
-              <strong>NO WRIST SIGNAL</strong>
-              <p>Start the Isaac scene host or connect the robot camera. The preview will attach automatically.</p>
-            </div>
-            <div class="camera-overlay camera-overlay-top">
-              <span>WRIST / RGB</span><span id="camera-live-badge">STANDBY</span>
-            </div>
-            <div class="camera-overlay camera-overlay-bottom">
-              <span id="camera-sequence">FRAME —</span><span id="camera-resolution">— × —</span>
-            </div>
-          </div>
-        </div>
-        <aside class="vision-aside">
-          <div>
-            <span class="section-label">Signal path</span>
-            <p>Robot-mounted RGB → Isaac RPC → local frame cache → operator console</p>
-          </div>
-          <div class="vision-metric">
-            <span>Source</span><strong id="camera-source">Disconnected</strong>
-          </div>
-          <div class="vision-metric">
-            <span>Refresh</span><strong>Automatic</strong>
-          </div>
-          <p class="vision-note" id="camera-message">The control interface is ready; the camera is waiting for the robot service.</p>
-        </aside>
-      </section>
-
       <section class="workspace" id="workspace">
         <article class="panel context-panel">
           <div class="panel-head">

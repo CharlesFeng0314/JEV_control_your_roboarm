@@ -36,6 +36,7 @@ def _decision(payload: dict[str, Any]) -> JevDecision:
         },
         arguments=dict(payload.get("arguments") or {}),
         answers=dict(payload.get("answers") or {}),
+        minor_questions=tuple(payload.get("minor_questions") or ()),
         latency_ms=float(payload.get("latency_ms", 0.0)),
     )
 

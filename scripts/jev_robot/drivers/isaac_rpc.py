@@ -8,6 +8,7 @@ commands.
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import threading
@@ -19,6 +20,7 @@ from typing import Any, Protocol
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from scripts.manipulation.perception.rgbd_geometry import quaternion_matrix
 from scripts.manipulation.perception.wrist_semantics import WristRgbdSemanticPerception
 
 from ..contracts import ActionOutcome, SceneSnapshot
@@ -57,6 +59,12 @@ CACHE_MATCH_RADIUS_M = 0.12
 LIFTED_PHASES = {"APPROACH_PLACE", "DESCEND_PLACE", "RELEASE", "RETREAT", "DONE"}
 MAX_MANIPULATION_STEPS = 3600
 PLACEMENT_VERIFY_TOLERANCE_M = 0.06
+MIN_HELD_FINGER_POSITION_M = 0.001
+MAX_TRACK_MATCH_RADIUS_M = 0.20
+PICK_DESCENT_STEP_M = 0.015
+PICK_ARRIVAL_TOLERANCE_M = 0.005
+PICK_ARRIVAL_ANGLE_RAD = 0.08
+MAX_PICK_WAYPOINT_STEPS = 180
 
 
 class PerceptionProvider(Protocol):
@@ -125,9 +133,8 @@ def read_stable_rgbd(
 ) -> dict[str, Any]:
     """Capture RGB-D and copy its files before another client can replace them.
 
-    The scene host publishes one shared live path. The web preview and JEV
-    perception both request frames, so the file read has to finish before the
-    next request is allowed to overwrite that path.
+    The scene host publishes one shared live path. The file read has to finish
+    before the next request is allowed to overwrite that path.
     """
 
     last_error: Exception | None = None
@@ -146,7 +153,7 @@ def read_stable_rgbd(
                 return packet
         time.sleep(0.02)
     raise IncompleteSensorFrame(
-        "The wrist RGB-D frame changed while the camera preview and perception were reading it."
+        "The wrist RGB-D frame changed while perception was reading it."
     ) from last_error
 
 
@@ -221,8 +228,10 @@ class IsaacRpcDriver:
         self._run_dir: Path | None = None
         self._visible_objects: tuple[dict[str, Any], ...] = ()
         self._object_tracks: dict[str, dict[str, Any]] = {}
+        self._geometry_dirty_refs: set[str] = set()
         self._next_object_id = 1
         self._held_target: dict[str, Any] | None = None
+        self._pick_recovery: dict[str, Any] | None = None
         self._active_destination: dict[str, Any] | None = None
         self._expected_place_position: tuple[float, float, float] | None = None
         self._place_parameters: dict[str, Any] | None = None
@@ -245,6 +254,12 @@ class IsaacRpcDriver:
             "perception": ["wrist_rgbd"],
             "perception_labels": self._perception.label_criteria,
             "motion_planner": "scene_host_owned",
+            "gripper_control": {
+                "mode": "position_until_contact",
+                "force_feedback_available": False,
+                "automatic_force_selection": False,
+                "hold_verification": "finger_contact_plus_lift",
+            },
             "supported_actions": [
                 "search_object",
                 "observe_object",
@@ -302,6 +317,7 @@ class IsaacRpcDriver:
             "joint_positions": list(state.get("joint_positions") or []),
             "hand_position_m": list(state.get("hand_position_m") or []),
             "hand_orientation_wxyz": list(state.get("hand_orientation_wxyz") or []),
+            "gripper": self._gripper_facts(state),
             "wrist_rgbd": {
                 "rgb_path": rgbd.get("rgb_path"),
                 "depth_path": rgbd.get("depth_path"),
@@ -311,6 +327,8 @@ class IsaacRpcDriver:
                 "shape": rgbd.get("shape"),
             },
         }
+        if self._pick_recovery is not None:
+            facts["pick_recovery"] = dict(self._pick_recovery)
         return SceneSnapshot(
             sequence=self._sequence,
             source="robot_mounted_sensors",
@@ -326,6 +344,34 @@ class IsaacRpcDriver:
         if not isinstance(raw, (list, tuple)) or len(raw) != 3:
             return None
         return tuple(float(value) for value in raw)
+
+    @classmethod
+    def _gripper_facts(cls, state: dict[str, Any]) -> dict[str, Any]:
+        try:
+            per_finger = cls._finger_width(state)
+        except RuntimeError:
+            return {"state_available": False}
+        return {
+            "state_available": True,
+            "per_finger_position_m": per_finger,
+            "aperture_m": 2.0 * per_finger,
+            "contact_state": "unknown_without_active_close_command",
+            "force_feedback_available": False,
+        }
+
+    @classmethod
+    def _track_match_radius(
+        cls, current: dict[str, Any], previous: dict[str, Any]
+    ) -> float:
+        spans = []
+        for item in (current, previous):
+            try:
+                low, high = cls._bounds(item)
+            except ValueError:
+                continue
+            spans.append(math.sqrt(sum((high[i] - low[i]) ** 2 for i in (0, 1))))
+        adaptive = 0.75 * max(spans, default=0.0)
+        return min(MAX_TRACK_MATCH_RADIUS_M, max(CACHE_MATCH_RADIUS_M, adaptive))
 
     def _track_observations(self, observations: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
         current = [dict(item) for item in observations]
@@ -351,7 +397,9 @@ class IsaacRpcDriver:
                     )
             rows, cols = linear_sum_assignment(costs)
             for row, col in zip(rows.tolist(), cols.tolist(), strict=True):
-                if costs[row, col] <= CACHE_MATCH_RADIUS_M:
+                current_item = current[row]
+                previous_item = self._object_tracks[previous[col][0]]
+                if costs[row, col] <= self._track_match_radius(current_item, previous_item):
                     assignments[row] = previous[col][0]
 
         tracked = []
@@ -367,10 +415,61 @@ class IsaacRpcDriver:
                 observation = fuse(best_id, observation)
                 observation["object_id"] = best_id
                 observation["sensor_sequence"] = self._sensor_sequence
+            previous_observation = self._object_tracks.get(best_id)
+            if previous_observation is not None:
+                if previous_observation.get("target_label_hint"):
+                    observation.setdefault(
+                        "target_label_hint", previous_observation["target_label_hint"]
+                    )
+                held_ref = (self._held_target or {}).get("object_id")
+                if best_id not in self._geometry_dirty_refs and best_id != held_ref:
+                    observation = self._stabilize_stationary_geometry(
+                        previous_observation, observation
+                    )
+            if not observation.get("partial_view", False):
+                self._geometry_dirty_refs.discard(best_id)
             self._object_tracks[best_id] = observation
             tracked.append(observation)
         self._visible_objects = tuple(tracked)
         return self._visible_objects
+
+    @classmethod
+    def _stabilize_stationary_geometry(
+        cls,
+        previous: dict[str, Any],
+        current: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Prefer complete geometry over a cropped view of an undisturbed object."""
+        if not current.get("partial_view", False):
+            return current
+        if previous.get("partial_view", False) and not previous.get("geometry_stabilized"):
+            return current
+        old_position = cls._position(previous)
+        new_position = cls._position(current)
+        if old_position is None or new_position is None:
+            return current
+        shift = math.dist(old_position, new_position)
+
+        old_grasp = previous.get("grasp")
+        new_grasp = current.get("grasp")
+        if not isinstance(old_grasp, dict) or not isinstance(new_grasp, dict):
+            return current
+        old_bounds = previous.get("bbox3d_world_m")
+        if not isinstance(old_bounds, (list, tuple)) or len(old_bounds) != 2:
+            return current
+
+        stabilized = dict(current)
+        stabilized["pose"] = dict(previous.get("pose") or {})
+        stabilized["bbox3d_world_m"] = old_bounds
+        stabilized["grasp"] = dict(old_grasp)
+        stabilized["geometry_stabilized"] = True
+        stabilized["geometry_shift_rejected_m"] = round(shift, 4)
+        stabilized["geometry_source_sensor_sequence"] = previous.get(
+            "geometry_source_sensor_sequence", previous.get("sensor_sequence")
+        )
+        if previous.get("target_label_hint"):
+            stabilized["target_label_hint"] = previous["target_label_hint"]
+        return stabilized
 
     def _perceive_current_view(self) -> tuple[dict[str, Any], ...]:
         packet = self._capture_rgbd()
@@ -390,6 +489,48 @@ class IsaacRpcDriver:
                 best_score = score
         return best, best_score
 
+    def _search_target_candidate(
+        self,
+        observations: tuple[dict[str, Any], ...],
+        target_label: str,
+    ) -> tuple[dict[str, Any] | None, float]:
+        recovery = self._pick_recovery
+        if recovery is not None and recovery.get("target_label") == target_label:
+            target_ref = str(recovery.get("target_ref") or "")
+            for observation in observations:
+                if str(observation.get("object_id") or "") != target_ref:
+                    continue
+                score = float((observation.get("semantic_scores") or {}).get(target_label, 0.0))
+                return observation, score
+            return None, 0.0
+        return self._target_candidate(observations, target_label)
+
+    def _search_candidate_ready(
+        self,
+        candidate: dict[str, Any] | None,
+        score: float,
+        threshold: float,
+        target_label: str,
+        *,
+        view_changed: bool,
+    ) -> bool:
+        if candidate is None:
+            return False
+        if candidate.get("partial_view") and not candidate.get("geometry_stabilized"):
+            return False
+        recovery = self._pick_recovery
+        if recovery is None or recovery.get("target_label") != target_label:
+            return score >= threshold
+        identity_confirmed = (
+            candidate.get("object_id") == recovery.get("target_ref")
+            and candidate.get("target_label_hint") == target_label
+        )
+        return (
+            (score >= threshold or identity_confirmed)
+            and view_changed
+            and bool((candidate.get("grasp") or {}).get("feasible", False))
+        )
+
     def _search_object(
         self,
         arguments: dict[str, Any],
@@ -404,12 +545,18 @@ class IsaacRpcDriver:
             raise ValueError(f"Unsupported search scope {search_scope!r}")
 
         observations = self._perceive_current_view()
-        candidate, score = self._target_candidate(observations, target_label)
+        candidate, score = self._search_target_candidate(observations, target_label)
         best_candidate, best_score = candidate, score
         visited_views = 1
         threshold = self._perception.minimum_target_score
         for pose in SEARCH_ARM_POSES[: SEARCH_SCOPE_VIEW_COUNT[search_scope]]:
-            if candidate is not None and score >= threshold:
+            if self._search_candidate_ready(
+                candidate,
+                score,
+                threshold,
+                target_label,
+                view_changed=visited_views > 1,
+            ):
                 break
             targets = {name: float(value) for name, value in zip(ARM_JOINTS, pose, strict=True)}
             self._call(
@@ -422,28 +569,63 @@ class IsaacRpcDriver:
                 timeout=180.0,
             )
             observations = self._perceive_current_view()
-            candidate, score = self._target_candidate(observations, target_label)
+            candidate, score = self._search_target_candidate(observations, target_label)
             if score > best_score:
                 best_candidate, best_score = candidate, score
             visited_views += 1
 
-        accepted = candidate is not None and score >= threshold
+        accepted = self._search_candidate_ready(
+            candidate,
+            score,
+            threshold,
+            target_label,
+            view_changed=visited_views > 1,
+        )
+        recovery_active = bool(
+            self._pick_recovery is not None
+            and self._pick_recovery.get("target_label") == target_label
+        )
+        selected = candidate if accepted else best_candidate
+        if accepted and selected is not None:
+            selected["target_label_hint"] = target_label
+            object_id = str(selected.get("object_id") or "")
+            if object_id:
+                self._object_tracks[object_id] = selected
+        grasp_feasible = bool((selected or {}).get("grasp", {}).get("feasible", False))
         data = {
             "target_label": target_label,
             "search_scope": search_scope,
             "visited_views": visited_views,
             "minimum_target_score": threshold,
             "best_target_score": best_score,
-            "observation": candidate if accepted else best_candidate,
+            "observation": selected,
             "visible_objects": list(observations),
+            "recovery_active": recovery_active,
+            "new_view_evaluated": visited_views > 1,
+            "manipulation_ready": accepted and grasp_feasible,
+            "search_exhausted": (
+                recovery_active
+                and not accepted
+                and visited_views >= 1 + SEARCH_SCOPE_VIEW_COUNT[search_scope]
+            ),
         }
+        if recovery_active and self._pick_recovery is not None:
+            data["target_ref"] = self._pick_recovery.get("target_ref")
         return ActionOutcome(
             action=action_name,
             success=accepted,
             message=(
-                f"Wrist RGB-D found {target_label!r} with score {score:.3f}"
+                f"Wrist RGB-D found grasp-ready {target_label!r} with score {score:.3f}"
+                if accepted and recovery_active
+                else f"Wrist RGB-D found {target_label!r} with score {score:.3f}"
                 if accepted
-                else (f"Wrist RGB-D did not accept {target_label!r}; best score {best_score:.3f}")
+                else (
+                    f"Wrist RGB-D found {target_label!r}, but no recovery view produced "
+                    "grasp-feasible geometry"
+                    if recovery_active and best_score >= threshold
+                    else f"Wrist RGB-D did not accept {target_label!r}; "
+                    f"best score {best_score:.3f}"
+                )
             ),
             data=data,
         )
@@ -484,6 +666,9 @@ class IsaacRpcDriver:
             {"cmd": "set_gripper", "width": target_m, "steps": 40},
             timeout=180.0,
         )
+        final_state = self._call({"cmd": "state"})
+        final_m = self._finger_width(final_state)
+        contact_inferred = command == "grasp" and final_m > MIN_HELD_FINGER_POSITION_M
         return ActionOutcome(
             action="adjust_gripper",
             success=True,
@@ -492,6 +677,9 @@ class IsaacRpcDriver:
                 "command": command,
                 "current_per_finger_m": current_m,
                 "target_per_finger_m": target_m,
+                "final_per_finger_m": final_m,
+                "contact_inferred": contact_inferred,
+                "force_feedback_available": False,
                 "stop_condition": arguments.get("stop_condition"),
             },
         )
@@ -604,12 +792,93 @@ class IsaacRpcDriver:
         return tuple(position)
 
     @staticmethod
-    def _failed_motion(action: str, state: dict[str, Any]) -> ActionOutcome:
+    def _failure_phase(state: dict[str, Any]) -> str:
+        reason = str(state.get("failure_reason") or "")
+        if " timed out" in reason:
+            return reason.split(" timed out", 1)[0]
+        return str(state.get("phase") or "UNKNOWN")
+
+    def _begin_pick_recovery(
+        self,
+        target: dict[str, Any],
+        *,
+        failure_phase: str,
+        failure_reason: str,
+    ) -> dict[str, Any]:
+        previous_recovery = self._pick_recovery or {}
+        same_target = previous_recovery.get("target_ref") == target.get("object_id")
+        previous_attempts = int(previous_recovery.get("pick_attempts", 0)) if same_target else 0
+        self._pick_recovery = {
+            "active": True,
+            "target_ref": target.get("object_id"),
+            "target_label": (
+                target.get("target_label_hint")
+                or (previous_recovery.get("target_label") if same_target else None)
+                or target.get("label")
+            ),
+            "failure_phase": failure_phase,
+            "failure_reason": failure_reason,
+            "pick_attempts": previous_attempts + 1,
+            "failed_sensor_sequence": target.get("sensor_sequence"),
+            "required_progress": "new_view_with_grasp_feasible_geometry",
+        }
+        return dict(self._pick_recovery)
+
+    def _failed_motion(
+        self,
+        action: str,
+        state: dict[str, Any],
+        *,
+        target: dict[str, Any] | None = None,
+    ) -> ActionOutcome:
+        reason = str(state.get("failure_reason") or "Robot motion did not complete")
+        data: dict[str, Any] = {
+            "phase": self._failure_phase(state),
+            "failure_reason": reason,
+            "robot_state": state,
+        }
+        if action == "pick_object" and target is not None:
+            data.update(
+                self._begin_pick_recovery(
+                    target,
+                    failure_phase=data["phase"],
+                    failure_reason=reason,
+                )
+            )
         return ActionOutcome(
             action=action,
             success=False,
-            message=str(state.get("failure_reason") or "Robot motion did not complete"),
-            data={"robot_state": state},
+            message=reason,
+            data=data,
+        )
+
+    @staticmethod
+    def _measured_grasp_pose(state: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        hand = np.asarray(state.get("hand_position_m"), dtype=np.float64)
+        orientation = np.asarray(state.get("hand_orientation_wxyz"), dtype=np.float64)
+        offset = np.asarray(state.get("grasp_in_hand_m"), dtype=np.float64)
+        if hand.shape != (3,) or orientation.shape != (4,) or offset.shape != (3,):
+            raise ValueError("Live robot state is missing the physical grasp-frame transform")
+        if not all(np.isfinite(value).all() for value in (hand, orientation, offset)):
+            raise ValueError("Live grasp-frame transform contains non-finite values")
+        norm = float(np.linalg.norm(orientation))
+        if norm < 1e-6:
+            raise ValueError("Live hand orientation is invalid")
+        orientation = orientation / norm
+        return hand + quaternion_matrix(orientation.tolist()) @ offset, orientation
+
+    @staticmethod
+    def _grasp_pose_reached(
+        measured: np.ndarray,
+        measured_orientation: np.ndarray,
+        position: np.ndarray,
+        orientation: np.ndarray,
+    ) -> bool:
+        dot = abs(float(np.dot(measured_orientation, orientation / np.linalg.norm(orientation))))
+        angle = 2.0 * math.acos(min(1.0, dot))
+        return bool(
+            np.linalg.norm(measured - position) <= PICK_ARRIVAL_TOLERANCE_M
+            and angle <= PICK_ARRIVAL_ANGLE_RAD
         )
 
     def _pick_object(self, arguments: dict[str, Any]) -> ActionOutcome:
@@ -620,15 +889,40 @@ class IsaacRpcDriver:
                 message="The gripper already has an active held-object belief",
                 data={"held_target_ref": self._held_target.get("object_id")},
             )
-        target = self._require_track(arguments.get("target_ref"), role="Target", fresh=True)
-        grasp = target.get("grasp") or {}
-        if not grasp.get("feasible", False):
+        target_ref = arguments.get("target_ref")
+        if not target_ref:
             return ActionOutcome(
                 action="pick_object",
                 success=False,
-                message="Wrist RGB-D geometry says the target exceeds the gripper opening",
-                data={"target_ref": target["object_id"], "grasp": grasp},
+                message="Pick requires one currently visible target with a stable object id",
             )
+        target = self._require_track(target_ref, role="Target", fresh=True)
+        grasp = target.get("grasp") or {}
+        incomplete_geometry = target.get("partial_view") and not target.get("geometry_stabilized")
+        if incomplete_geometry or not grasp.get("feasible", False):
+            reason = (
+                "Target is cropped by the wrist image and has no complete stationary geometry"
+                if incomplete_geometry
+                else "Wrist RGB-D geometry says the target exceeds the gripper opening"
+            )
+            recovery = self._begin_pick_recovery(
+                target,
+                failure_phase="PREGRASP_VALIDATION",
+                failure_reason=reason,
+            )
+            return ActionOutcome(
+                action="pick_object",
+                success=False,
+                message=reason,
+                data={**recovery, "grasp": grasp},
+            )
+        required_opening = float(grasp.get("required_opening_m") or 0.08)
+        pregrasp_per_finger = min(0.04, max(0.01, 0.5 * required_opening + 0.003))
+        self._geometry_dirty_refs.add(str(target_ref))
+        self._call(
+            {"cmd": "set_gripper", "width": pregrasp_per_finger, "steps": 60},
+            timeout=180.0,
+        )
         self._call(
             {
                 "cmd": "set_pick",
@@ -641,7 +935,7 @@ class IsaacRpcDriver:
         self._call(
             {
                 "cmd": "set_pregrasp_verified",
-                "verified": True,
+                "verified": False,
                 "evidence": {
                     "source": target.get("source"),
                     "sensor_sequence": target.get("sensor_sequence"),
@@ -649,12 +943,80 @@ class IsaacRpcDriver:
                 },
             }
         )
+        final_position = np.asarray(grasp["grasp_position_world_m"], dtype=np.float64)
+        final_orientation = np.asarray(grasp["grasp_orientation_wxyz"], dtype=np.float64)
+        descent_waypoint: np.ndarray | None = None
+        aligned_frames = 0
+        waypoint_steps = 0
+        arrival_verified = False
         last_state: dict[str, Any] = {}
         for _ in range(MAX_MANIPULATION_STEPS):
             last_state = self._call({"cmd": "manipulation_step"}, timeout=60.0)
             if last_state.get("failed"):
-                return self._failed_motion("pick_object", last_state)
+                return self._failed_motion("pick_object", last_state, target=target)
+            if last_state.get("phase") == "DESCEND_PICK" and not arrival_verified:
+                measured, measured_orientation = self._measured_grasp_pose(last_state)
+                waypoint_steps += 1
+                if waypoint_steps > MAX_PICK_WAYPOINT_STEPS:
+                    last_state = {
+                        **last_state,
+                        "failure_reason": "Guarded descent could not align with its next waypoint",
+                        "descent_waypoint_m": descent_waypoint.tolist(),
+                        "measured_grasp_position_m": measured.tolist(),
+                    }
+                    return self._failed_motion("pick_object", last_state, target=target)
+                waypoint_reached = descent_waypoint is not None and self._grasp_pose_reached(
+                    measured, measured_orientation, descent_waypoint, final_orientation
+                )
+                aligned_frames = aligned_frames + 1 if waypoint_reached else 0
+                waypoint_reached = aligned_frames >= 3
+                if waypoint_reached and descent_waypoint[2] <= final_position[2]:
+                    self._call({
+                        "cmd": "set_pregrasp_verified",
+                        "verified": True,
+                        "evidence": {
+                            "target_ref": target_ref,
+                            "measured_grasp_position_m": measured.tolist(),
+                            "position_error_m": float(np.linalg.norm(measured - final_position)),
+                        },
+                    })
+                    arrival_verified = True
+                elif descent_waypoint is None or waypoint_reached:
+                    # Keep each arm goal near the last aligned pose so descent cannot arc
+                    # sideways through the object on its way to an otherwise correct endpoint.
+                    previous_z = measured[2] if descent_waypoint is None else descent_waypoint[2]
+                    descent_waypoint = final_position.copy()
+                    descent_waypoint[2] = max(final_position[2], previous_z - PICK_DESCENT_STEP_M)
+                    aligned_frames = 0
+                    waypoint_steps = 0
+                    self._call({
+                        "cmd": "set_pick",
+                        "position": descent_waypoint.tolist(),
+                        "orientation_wxyz": final_orientation.tolist(),
+                        "z_offset": float(grasp["grasp_z_offset_from_centroid_m"]),
+                    })
             if str(last_state.get("phase")) in LIFTED_PHASES:
+                fingers = [float(value) for value in last_state.get("finger_positions_m") or []]
+                contact_inferred = bool(fingers) and min(fingers) > MIN_HELD_FINGER_POSITION_M
+                hold_verified = contact_inferred and bool(last_state.get("lift_verified", False))
+                if not hold_verified:
+                    reason = "Lift phase reached without verified finger contact and hold"
+                    recovery = self._begin_pick_recovery(
+                        target,
+                        failure_phase=str(last_state.get("phase") or "LIFT"),
+                        failure_reason=reason,
+                    )
+                    return ActionOutcome(
+                        action="pick_object",
+                        success=False,
+                        message=reason,
+                        data={
+                            **recovery,
+                            "phase": last_state.get("phase"),
+                            "finger_positions_m": fingers,
+                        },
+                    )
+                self._pick_recovery = None
                 self._held_target = dict(target)
                 return ActionOutcome(
                     action="pick_object",
@@ -664,12 +1026,16 @@ class IsaacRpcDriver:
                         "target_ref": target["object_id"],
                         "phase": last_state.get("phase"),
                         "finger_positions_m": last_state.get("finger_positions_m"),
+                        "contact_inferred": contact_inferred,
+                        "hold_verified": hold_verified,
+                        "grasp_stabilized": last_state.get("grasp_stabilized"),
+                        "pregrasp_per_finger_m": pregrasp_per_finger,
                         "grasp": grasp,
                     },
                 )
             if not last_state.get("alive", True):
                 break
-        return self._failed_motion("pick_object", last_state)
+        return self._failed_motion("pick_object", last_state, target=target)
 
     def _place_object(self, arguments: dict[str, Any]) -> ActionOutcome:
         if self._held_target is None:

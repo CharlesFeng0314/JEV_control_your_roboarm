@@ -167,7 +167,7 @@ cd H:\robo
 H:\robo\.conda\python.exe -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_franka_live
 ```
 
-The browser opens locally. When **Wrist camera** changes from `NO WRIST SIGNAL` to `LIVE`, the Sim/RPC link is ready. Enter a goal and choose **Start fresh run**; every click begins at turn 1.
+The browser opens locally. Enter a goal and choose **Start fresh run**; every click begins at turn 1. The robot still uses wrist RGB-D internally for perception, but the Web console does not stream a camera preview.
 
 To run headlessly instead:
 

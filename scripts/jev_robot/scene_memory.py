@@ -45,6 +45,7 @@ class SceneMemory:
             "latest_robot_facts": {},
             "unknown_regions": [],
             "recent_actions": [],
+            "active_bindings": {},
         }
 
     @classmethod
@@ -145,7 +146,32 @@ class SceneMemory:
         if self.payload.get("active_goal") == goal:
             return
         self.payload["active_goal"] = goal
+        self.payload["active_bindings"] = {}
         self.payload["goal_started_at"] = utc_now()
+        self.payload["revision"] = int(self.payload["revision"]) + 1
+        self.save()
+
+    def bind_object(self, role: str, object_id: object, *, goal: str) -> None:
+        """Lock a JEV-selected physical role to stable scene identity for this goal."""
+
+        if role not in {"target", "destination"}:
+            raise ValueError(f"Unsupported scene binding role {role!r}")
+        reference = str(object_id or "").strip()
+        if not reference:
+            return
+        record = (self.payload.get("known_objects") or {}).get(reference)
+        if not isinstance(record, dict):
+            return
+        bindings = self.payload.setdefault("active_bindings", {})
+        existing = bindings.get(role) or {}
+        if existing.get("object_id") == reference and existing.get("goal") == goal.strip():
+            return
+        bindings[role] = {
+            "object_id": reference,
+            "label": record.get("label"),
+            "goal": goal.strip(),
+            "bound_at": utc_now(),
+        }
         self.payload["revision"] = int(self.payload["revision"]) + 1
         self.save()
 
@@ -176,18 +202,27 @@ class SceneMemory:
         return True
 
     def prompt_view(self) -> dict[str, Any]:
+        bound_ids = {
+            str(item.get("object_id"))
+            for item in (self.payload.get("active_bindings") or {}).values()
+            if isinstance(item, dict) and item.get("object_id")
+        }
         known = []
         for key in sorted(self.payload["known_objects"]):
             record = self.payload["known_objects"][key]
+            latest = record.get("latest_observation") or {}
+            latest_label = latest.get("label") or latest.get("description")
+            stable_description = latest.get("description")
+            if latest_label and str(latest_label) != str(record["label"]):
+                stable_description = str(record["label"])
             known.append(
                 {
                     "object_id": record["object_id"],
                     "label": record["label"],
-                    "description": (record.get("latest_observation") or {}).get("description"),
-                    "attributes": (record.get("latest_observation") or {}).get("attributes", {}),
-                    "bbox3d_world_m": (record.get("latest_observation") or {}).get(
-                        "bbox3d_world_m"
-                    ),
+                    "description": stable_description,
+                    "latest_observed_label": latest_label,
+                    "attributes": latest.get("attributes", {}),
+                    "bbox3d_world_m": latest.get("bbox3d_world_m"),
                     "label_evidence": record.get("label_evidence", {}),
                     "latest_pose": record.get("latest_pose"),
                     "latest_confidence": record.get("latest_confidence"),
@@ -197,6 +232,7 @@ class SceneMemory:
                     "stale": record["stale"],
                     "last_seen_at": record["last_seen_at"],
                     "pose_observation_count": len(record.get("pose_history", [])),
+                    "identity_locked": key in bound_ids,
                 }
             )
         return {
@@ -206,6 +242,7 @@ class SceneMemory:
                 "Controller-owned persistent belief resent to stateless JEV on every decision."
             ),
             "known_objects": known,
+            "active_bindings": dict(self.payload.get("active_bindings") or {}),
             "latest_robot_facts": self.payload["latest_robot_facts"],
             "unknown_regions": self.payload["unknown_regions"],
         }

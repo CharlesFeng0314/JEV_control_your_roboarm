@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 from PIL import Image
 from scipy.optimize import linear_sum_assignment
@@ -245,24 +246,13 @@ def _grasp_geometry(
     footprint = world[mask & (depth_mm > 0), :2]
     if len(footprint) < 8:
         raise ValueError("Object mask has too few points for grasp geometry")
-    centered = footprint - np.median(footprint, axis=0)
-    eigenvalues, eigenvectors = np.linalg.eigh(np.cov(centered, rowvar=False))
-    long_axis = eigenvectors[:, int(np.argmax(eigenvalues))]
-    short_axis = np.asarray([-long_axis[1], long_axis[0]], dtype=np.float64)
-    long_extent = float(np.ptp(centered @ long_axis))
-    short_extent = float(np.ptp(centered @ short_axis))
-    if short_extent > long_extent:
-        long_extent, short_extent = short_extent, long_extent
-        long_axis = short_axis
+    footprint_center, long_axis, long_extent, short_extent = _minimum_area_footprint(footprint)
     yaw = float(np.arctan2(long_axis[1], long_axis[0])) + np.pi
     orientation = [0.0, float(np.cos(yaw / 2.0)), float(np.sin(yaw / 2.0)), 0.0]
 
     bounds = np.asarray(geometry["bbox3d_world_m"], dtype=np.float64)
     center = 0.5 * (bounds[0] + bounds[1])
-    eye = np.asarray(pose["eye_world_m"], dtype=np.float64)
-    forward = np.asarray(pose["target_world_m"], dtype=np.float64) - eye
-    forward /= np.linalg.norm(forward)
-    center += forward * float(config["perception"]["visible_surface_center_bias_m"])
+    center[:2] = footprint_center
     table_z = float(config["table_top_z_m"])
     if config["perception"].get("infer_upright_center_z_from_table", False):
         center[2] = 0.5 * (table_z + float(bounds[1, 2]))
@@ -271,6 +261,9 @@ def _grasp_geometry(
     grasp_position[2] = (
         table_z + float(config["perception"]["upright_grasp_height_fraction"]) * height
     )
+    # Keep the palm above tall objects; only the usable finger pads enter the grasp.
+    maximum_insertion = float(config["perception"].get("maximum_top_grasp_depth_m", 0.025))
+    grasp_position[2] = max(grasp_position[2], float(bounds[1, 2]) - maximum_insertion)
     clearance = 0.008
     return {
         "center_world_m": center.tolist(),
@@ -282,7 +275,25 @@ def _grasp_geometry(
         "long_extent_m": long_extent,
         "feasible": short_extent + clearance <= 0.08,
         "approach": "top_down",
+        "insertion_depth_m": float(bounds[1, 2] - grasp_position[2]),
     }
+
+
+def _minimum_area_footprint(
+    footprint: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Estimate box axes without PCA's bias toward the most visible face."""
+    center, (width, height), angle_degrees = cv2.minAreaRect(
+        np.asarray(footprint, dtype=np.float32)
+    )
+    angle = float(np.deg2rad(angle_degrees))
+    if height > width:
+        angle += np.pi / 2.0
+        long_extent, short_extent = float(height), float(width)
+    else:
+        long_extent, short_extent = float(width), float(height)
+    long_axis = np.asarray([np.cos(angle), np.sin(angle)], dtype=np.float64)
+    return np.asarray(center, dtype=np.float64), long_axis, long_extent, short_extent
 
 
 def _masked_crop(rgb: np.ndarray, mask: np.ndarray, bbox: list[int]) -> Image.Image:
@@ -462,6 +473,8 @@ class WristRgbdSemanticPerception:
                 self.config,
             )
             color = _dominant_color(rgb, mask)
+            x1, y1, x2, y2 = candidate["bbox_xyxy"]
+            partial_view = x1 <= 2 or y1 <= 2 or x2 >= rgb.shape[1] - 2 or y2 >= rgb.shape[0] - 2
             observation = {
                 "label": labels[best],
                 "description": f"{color} {labels[best]}",
@@ -473,6 +486,7 @@ class WristRgbdSemanticPerception:
                 },
                 "source": "wrist_rgbd_world_cluster_semantic_view",
                 "mask_area_px": int(candidate["area_px"]),
+                "partial_view": bool(partial_view),
                 "semantic_scores": {
                     label: float(scores[index]) for index, label in enumerate(labels)
                 },

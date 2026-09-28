@@ -174,7 +174,7 @@ cd H:\robo
 H:\robo\.conda\python.exe -m scripts.jev_robot.app --driver-factory scripts.jev_robot.drivers.isaac_rpc:create_driver --scene-id tabletop_franka_live
 ```
 
-浏览器会打开本地控制台。页面中的 **Wrist camera** 从 `NO WRIST SIGNAL` 变成 `LIVE`，就表示 Sim 与 RPC 已接通；它会持续显示机械腕部 RGB 画面。输入任务并点击 **Start fresh run**，每次都会从 turn 1 开始。
+浏览器会打开本地控制台。输入任务并点击 **Start fresh run**，每次都会从 turn 1 开始。机械臂仍会在内部使用腕部 RGB-D 做感知，但 Web 控制台不再传输或显示相机预览。
 
 也可以不打开 Web 页面，直接运行一句任务：
 

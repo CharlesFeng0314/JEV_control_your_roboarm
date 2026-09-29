@@ -72,6 +72,10 @@ def main() -> None:
         target_ref = observed.data["observation"]["object_id"]
         picked = driver.execute_action(action("pick_object"), {"target_ref": target_ref})
         print("PICK=" + json.dumps(picked.to_dict(), ensure_ascii=True), flush=True)
+        diagnostics = driver._call({"cmd": "validation_diagnostics"})
+        (run_dir / "diagnostics.json").write_text(
+            json.dumps(diagnostics, indent=2), encoding="utf-8"
+        )
         after = driver._call({"cmd": "object_state"})
         if picked.success:
             driver._call({"cmd": "step", "n": 120})

@@ -853,6 +853,25 @@ class IsaacRpcDriver:
         )
 
     @staticmethod
+    def _nearest_parallel_grasp_orientation(
+        planned: list[float], measured: list[float]
+    ) -> list[float]:
+        desired = np.asarray(planned, dtype=np.float64)
+        current = np.asarray(measured, dtype=np.float64)
+        if desired.shape != (4,) or current.shape != (4,):
+            raise ValueError("Grasp orientation requires two wxyz quaternions")
+        if not np.isfinite(desired).all() or not np.isfinite(current).all():
+            raise ValueError("Grasp orientation must be finite")
+        if min(np.linalg.norm(desired), np.linalg.norm(current)) < 1e-6:
+            raise ValueError("Grasp orientation quaternion is invalid")
+        desired /= np.linalg.norm(desired)
+        current /= np.linalg.norm(current)
+        w, x, y, z = desired
+        # Half a turn about the tool's approach axis exchanges identical fingers.
+        alternate = np.asarray([-z, y, -x, w])
+        return max((desired, alternate), key=lambda q: abs(float(q @ current))).tolist()
+
+    @staticmethod
     def _measured_grasp_pose(state: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
         hand = np.asarray(state.get("hand_position_m"), dtype=np.float64)
         orientation = np.asarray(state.get("hand_orientation_wxyz"), dtype=np.float64)
@@ -917,6 +936,13 @@ class IsaacRpcDriver:
                 data={**recovery, "grasp": grasp},
             )
         required_opening = float(grasp.get("required_opening_m") or 0.08)
+        current_state = self._call({"cmd": "state"})
+        grasp = {
+            **grasp,
+            "grasp_orientation_wxyz": self._nearest_parallel_grasp_orientation(
+                grasp["grasp_orientation_wxyz"], current_state["hand_orientation_wxyz"]
+            ),
+        }
         pregrasp_per_finger = min(0.04, max(0.01, 0.5 * required_opening + 0.003))
         self._geometry_dirty_refs.add(str(target_ref))
         self._call(

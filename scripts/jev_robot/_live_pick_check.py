@@ -47,6 +47,7 @@ def main() -> None:
     driver = IsaacRpcDriver(transport=traced_transport)
     driver.start_session(run_dir)
     try:
+        driver._call({"cmd": "reset_validation_scene", "settle_steps": 120}, timeout=180.0)
         before = driver._call({"cmd": "object_state"})
         pose = SEARCH_ARM_POSES[0]
         driver._call(
@@ -70,6 +71,7 @@ def main() -> None:
             raise RuntimeError(observed.message)
 
         target_ref = observed.data["observation"]["object_id"]
+        driver._call({"cmd": "set_overlay", "action": "pick_object"})
         picked = driver.execute_action(action("pick_object"), {"target_ref": target_ref})
         print("PICK=" + json.dumps(picked.to_dict(), ensure_ascii=True), flush=True)
         diagnostics = driver._call({"cmd": "validation_diagnostics"})

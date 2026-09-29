@@ -481,7 +481,7 @@ class WristRgbdSemanticPerception:
                 "attributes": {"color": color},
                 "confidence": float(scores[best]),
                 "pose": {
-                    "frame": "robot_base",
+                    "frame": "world",
                     "position_m": grasp["center_world_m"],
                 },
                 "source": "wrist_rgbd_world_cluster_semantic_view",
